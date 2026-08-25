@@ -194,6 +194,10 @@ function buildSurfaceMaterials() {
 
 function applyColorAwareMaterials(mesh: THREE.Mesh) {
   let geometry = mesh.geometry.clone()
+  // Some Hunyuan outputs contain positions and vertex colors but omit
+  // normals entirely. MeshStandardMaterial cannot light those meshes, which
+  // makes an otherwise detailed asset appear as a black silhouette.
+  if (!geometry.hasAttribute('normal')) geometry.computeVertexNormals()
   mesh.geometry = geometry
   const colors = geometry.getAttribute('color')
   const index = geometry.getIndex()
@@ -356,6 +360,7 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
       if (object.geometry.hasAttribute('color')) applyColorAwareMaterials(object)
       else {
         object.geometry = object.geometry.clone()
+        if (!object.geometry.hasAttribute('normal')) object.geometry.computeVertexNormals()
         object.material = Array.isArray(object.material)
           ? object.material.map((material) => material.clone())
           : object.material.clone()
