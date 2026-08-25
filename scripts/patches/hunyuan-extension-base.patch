@@ -1,0 +1,87 @@
+diff --git a/generator.py b/generator.py
+index e012ab6..46e0a46 100644
+--- a/generator.py
++++ b/generator.py
+@@ -151,7 +151,10 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+ 
+     def _preprocess(self, image_bytes: bytes) -> Image.Image:
+         import rembg
+-        img = Image.open(io.BytesIO(image_bytes))
++        img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
++        alpha_min, _alpha_max = img.getchannel("A").getextrema()
++        if alpha_min < 255:
++            return img
+         try:
+             return rembg.remove(img).convert("RGBA")
+         except Exception:
+@@ -162,11 +165,40 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+     def _decimate(self, mesh, target_vertices: int):
+         target_faces = max(4, target_vertices * 2)
+         try:
+-            return mesh.simplify_quadric_decimation(target_faces)
++            simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+         except Exception as exc:
+             print(f"[Hunyuan3DMiniGenerator] Decimation skipped: {exc}")
+             return mesh
+ 
++        if simplified.is_watertight:
++            return simplified
++
++        try:
++            import pymeshlab
++            import trimesh
++
++            mesh_set = pymeshlab.MeshSet()
++            mesh_set.add_mesh(pymeshlab.Mesh(
++                vertex_matrix=simplified.vertices,
++                face_matrix=simplified.faces,
++            ))
++            mesh_set.apply_filter("meshing_repair_non_manifold_edges", method=0)
++            mesh_set.apply_filter(
++                "meshing_close_holes",
++                maxholesize=1000,
++                selfintersection=True,
++            )
++            repaired = mesh_set.current_mesh()
++            result = trimesh.Trimesh(
++                vertices=repaired.vertex_matrix(),
++                faces=repaired.face_matrix(),
++                process=True,
++            )
++            return result if result.is_watertight else simplified
++        except Exception as exc:
++            print(f"[Hunyuan3DMiniGenerator] Watertight repair skipped: {exc}")
++            return simplified
++
+     def _download_weights(self) -> None:
+         from huggingface_hub import snapshot_download
+         print(f"[Hunyuan3DMiniGenerator] Downloading {_HF_REPO_ID} (base variant)…")
+diff --git a/manifest.json b/manifest.json
+index e3ce9eb..a97c7c5 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -19,8 +19,10 @@
+       "hf_skip_prefixes": [
+         "hunyuan3d-dit-v2-mini-turbo/",
+         "hunyuan3d-dit-v2-mini-fast/",
++        "hunyuan3d-dit-v2-mini/model.fp16.ckpt",
+         "hunyuan3d-vae-v2-mini-turbo/",
+-        "hunyuan3d-vae-v2-mini-withencoder/"
++        "hunyuan3d-vae-v2-mini-withencoder/",
++        "hunyuan3d-vae-v2-mini/model.fp16.ckpt"
+       ],
+       "params_schema": [
+         {
+diff --git a/setup.py b/setup.py
+index b60f41a..67dcb36 100644
+--- a/setup.py
++++ b/setup.py
+@@ -192,6 +192,7 @@ def setup(
+         "Pillow",
+         "numpy",
+         "trimesh",
++        "fast-simplification",
+         "pymeshlab",
+         "opencv-python-headless",
+         "huggingface_hub",
+

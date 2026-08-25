@@ -1,0 +1,135 @@
+diff --git a/api/routers/generation.py b/api/routers/generation.py
+index ad59899..35dc11f 100644
+--- a/api/routers/generation.py
++++ b/api/routers/generation.py
+@@ -88,6 +88,73 @@ async def generate_from_image(
+     return {"job_id": job_id}
+ 
+ 
++@router.post("/from-images")
++async def generate_from_images(
++    background_tasks: BackgroundTasks,
++    front: UploadFile | None = File(None),
++    left: UploadFile | None = File(None),
++    back: UploadFile | None = File(None),
++    right: UploadFile | None = File(None),
++    top: UploadFile | None = File(None),
++    bottom: UploadFile | None = File(None),
++    model_id: str = Form("hunyuan3d-mini/multiview"),
++    collection: str = Form("Default"),
++    remesh: str = Form("none"),
++    enable_texture: bool = Form(False),
++    texture_resolution: int = Form(1024),
++    params: str = Form("{}"),
++):
++    uploads = {
++        "front": front,
++        "left": left,
++        "back": back,
++        "right": right,
++        "top": top,
++        "bottom": bottom,
++    }
++    supplied = {view: upload for view, upload in uploads.items() if upload is not None}
++    if not supplied:
++        raise HTTPException(400, "At least one reference image is required")
++    if not any(view in supplied for view in ("front", "left", "back", "right")):
++        raise HTTPException(400, "Shape generation requires a front, left, back, or right image")
++    for view, upload in supplied.items():
++        if not upload.content_type or not upload.content_type.startswith("image/"):
++            raise HTTPException(400, f"{view} reference must be an image")
++
++    if remesh not in ("quad", "triangle", "none"):
++        raise HTTPException(400, "remesh must be 'quad', 'triangle', or 'none'")
++    collection = collection.strip()
++    if not collection or _re.search(r'[/:*?"<>|\\]', collection):
++        collection = "Default"
++
++    try:
++        generator_registry.get_generator(model_id)
++    except ValueError as exc:
++        raise HTTPException(400, str(exc))
++    generator_registry.switch_model(model_id)
++
++    try:
++        model_params = json.loads(params)
++    except (json.JSONDecodeError, TypeError):
++        model_params = {}
++
++    image_set = {view: await upload.read() for view, upload in supplied.items()}
++    full_params = {
++        "remesh": remesh,
++        "enable_texture": enable_texture,
++        "texture_resolution": texture_resolution,
++        **model_params,
++    }
++
++    _purge_old_jobs()
++    job_id = str(uuid.uuid4())
++    job = JobStatus(job_id=job_id, status="pending", progress=0)
++    _jobs[job_id] = job
++    _cancel_events[job_id] = threading.Event()
++    background_tasks.add_task(_run_generation, job_id, image_set, full_params, collection)
++    return {"job_id": job_id}
++
++
+ 
+ @router.get("/status/{job_id}")
+ async def job_status(job_id: str):
+diff --git a/api/runner.py b/api/runner.py
+index 12f2bf2..4f4dfcf 100644
+--- a/api/runner.py
++++ b/api/runner.py
+@@ -157,7 +157,13 @@ def main() -> None:
+             elif action == "generate":
+                 cancel_evt = threading.Event()
+                 _cancel[rid] = cancel_evt
+-                image_bytes  = base64.b64decode(msg["image_b64"])
++                if msg.get("images_b64"):
++                    image_bytes = {
++                        view: base64.b64decode(data)
++                        for view, data in msg["images_b64"].items()
++                    }
++                else:
++                    image_bytes = base64.b64decode(msg["image_b64"])
+                 params       = msg.get("params", {})
+                 if msg.get("outputs_dir"):
+                     gen.outputs_dir = Path(msg["outputs_dir"])
+diff --git a/api/services/extension_process.py b/api/services/extension_process.py
+index 60ce678..857dfd2 100644
+--- a/api/services/extension_process.py
++++ b/api/services/extension_process.py
+@@ -275,7 +275,7 @@ class ExtensionProcess:
+ 
+     def generate(
+         self,
+-        image_bytes: bytes,
++        image_bytes: bytes | dict[str, bytes],
+         params: dict,
+         progress_cb: Optional[Callable[[int, str], None]] = None,
+         cancel_event: Optional[threading.Event] = None,
+@@ -283,13 +283,20 @@ class ExtensionProcess:
+         from services.generators.base import GenerationCancelled
+ 
+         req_id = str(uuid.uuid4())
+-        self._send({
++        message = {
+             "action":      "generate",
+             "id":          req_id,
+-            "image_b64":   base64.b64encode(image_bytes).decode(),
+             "params":      params,
+             "outputs_dir": str(self.outputs_dir) if self.outputs_dir else None,
+-        })
++        }
++        if isinstance(image_bytes, dict):
++            message["images_b64"] = {
++                view: base64.b64encode(data).decode()
++                for view, data in image_bytes.items()
++            }
++        else:
++            message["image_b64"] = base64.b64encode(image_bytes).decode()
++        self._send(message)
+ 
+         # Grace period after sending a cooperative cancel before hard-killing
+         # the subprocess. Long enough to let generators that check cancel_event
+

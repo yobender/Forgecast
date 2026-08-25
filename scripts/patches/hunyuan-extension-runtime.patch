@@ -1,0 +1,473 @@
+diff --git a/generator.py b/generator.py
+index 46e0a46..7e4772c 100644
+--- a/generator.py
++++ b/generator.py
+@@ -24,14 +24,21 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+     MODEL_ID     = "hunyuan3d-mini"
+     DISPLAY_NAME = "Hunyuan3D 2 Mini"
+     VRAM_GB      = 6
++    _background_session = None
+ 
+     # ------------------------------------------------------------------ #
+     # Lifecycle
+     # ------------------------------------------------------------------ #
+ 
++    def _model_subfolder(self) -> str:
++        check = Path(self.download_check) if self.download_check else Path(_SUBFOLDER)
++        return check.parent.as_posix() if check.suffix else check.as_posix()
++
+     def is_downloaded(self) -> bool:
+-        subfolder = self.download_check if self.download_check else _SUBFOLDER
+-        model_dir = self.model_dir / subfolder
++        check = Path(self.download_check) if self.download_check else Path(_SUBFOLDER)
++        if check.suffix:
++            return (self.model_dir / check).exists()
++        model_dir = self.model_dir / check
+         return model_dir.exists() and (model_dir / "model.fp16.safetensors").exists()
+ 
+     def load(self) -> None:
+@@ -56,15 +63,34 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+             device = "cuda" if torch.cuda.is_available() else "cpu"
+             dtype  = torch.float16 if device == "cuda" else torch.float32
+ 
+-        subfolder = self.download_check if self.download_check else _SUBFOLDER
++        subfolder = self._model_subfolder()
++        use_cpu_offload = device == "cuda" and "mv" in subfolder.lower()
++        load_device = "cpu" if use_cpu_offload else device
+         print(f"[Hunyuan3DMiniGenerator] Loading pipeline from {self.model_dir} (subfolder={subfolder})…")
+         pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+             str(self.model_dir),
+             subfolder=subfolder,
+             use_safetensors=True,
+-            device=device,
++            device=load_device,
+             dtype=dtype,
+         )
++        if use_cpu_offload:
++            # The upstream shape pipeline's offload helper references a
++            # Diffusers-style `components` mapping, but some Hunyuan3D-2
++            # revisions do not initialize it. Supply the three modules the
++            # helper already declares in model_cpu_offload_seq.
++            if not hasattr(pipeline, "components"):
++                pipeline.components = {
++                    "conditioner": pipeline.conditioner,
++                    "model": pipeline.model,
++                    "vae": pipeline.vae,
++                }
++            pipeline.enable_model_cpu_offload(device=device)
++            # Hunyuan3D's call path uses `self.device` directly for scheduler
++            # timesteps and latents. Its offload helper leaves that marker on
++            # CPU even though Accelerate executes each hooked module on CUDA.
++            pipeline.device = torch.device(device)
++            print("[Hunyuan3DMiniGenerator] Enabled staged CPU offload for multi-view generation.")
+         self._model = pipeline
+         print(f"[Hunyuan3DMiniGenerator] Loaded on {device}.")
+ 
+@@ -85,7 +111,7 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+ 
+     def generate(
+         self,
+-        image_bytes: bytes,
++        image_bytes: bytes | dict[str, bytes],
+         params: dict,
+         progress_cb: Optional[Callable[[int, str], None]] = None,
+         cancel_event: Optional[threading.Event] = None,
+@@ -96,20 +122,68 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+         vert_count       = int(params.get("vertex_count", 0))
+         octree_res       = int(params.get("octree_resolution", 380))
+         guidance_scale   = float(params.get("guidance_scale", 5.5))
++        clean_shape_guides = bool(params.get("clean_shape_guides", False))
++        shape_source     = str(params.get("shape_source", "all"))
+         seed             = int(params.get("seed", -1))
+         if seed == -1:
+             seed = random.randint(0, 2**32 - 1)
+ 
+-        self._report(progress_cb, 5, "Removing background…")
+-        image = self._preprocess(image_bytes)
++        if isinstance(image_bytes, dict):
++            self._report(progress_cb, 5, f"Preparing {len(image_bytes)} reference views…")
++            valid_reference_bytes = {
++                view: data
++                for view, data in image_bytes.items()
++                if view in {"front", "left", "back", "right", "top", "bottom"}
++            }
++            reference_views = {}
++            total_views = max(1, len(valid_reference_bytes))
++            for index, (view, data) in enumerate(valid_reference_bytes.items(), start=1):
++                reference_views[view] = self._preprocess(data)
++                prep_progress = 5 + round(5 * index / total_views)
++                self._report(
++                    progress_cb,
++                    prep_progress,
++                    f"Prepared {index} of {total_views} reference views…",
++                )
++            shape_views = {
++                view: (
++                    self._prepare_shape_guide(reference_views[view])
++                    if clean_shape_guides
++                    else reference_views[view]
++                )
++                for view in ("front", "left", "back", "right")
++                if view in reference_views
++            }
++            if not shape_views:
++                raise ValueError("Multi-view generation requires a front, left, back, or right image.")
++            if shape_source == "front":
++                if "front" not in shape_views:
++                    raise ValueError("Front-priority generation requires a front reference image.")
++                image = shape_views["front"]
++            else:
++                image = shape_views
++        else:
++            self._report(progress_cb, 5, "Removing background…")
++            primary_image = self._preprocess(image_bytes)
++            reference_views = {"front": primary_image}
++            image = (
++                self._prepare_shape_guide(primary_image)
++                if clean_shape_guides
++                else primary_image
++            )
+         self._check_cancelled(cancel_event)
+ 
+-        self._report(progress_cb, 12, "Generating 3D shape…")
++        view_count = len(image) if isinstance(image, dict) else 1
++        shape_label = f"Fusing {view_count} views into 3D shape…" if view_count > 1 else "Generating 3D shape…"
++        self._report(progress_cb, 12, shape_label)
+         stop_evt = threading.Event()
+         if progress_cb:
+             t = threading.Thread(
+                 target=smooth_progress,
+-                args=(progress_cb, 12, 82, "Generating 3D shape…", stop_evt),
++                # High-detail volume decoding takes about four minutes on the
++                # local GPU. Advance gradually so the UI does not race to 80%
++                # in thirty seconds and then appear frozen.
++                args=(progress_cb, 12, 82, shape_label, stop_evt, 20.0),
+                 daemon=True,
+             )
+             t.start()
+@@ -133,10 +207,18 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+         self._check_cancelled(cancel_event)
+ 
+         if vert_count > 0 and hasattr(mesh, "vertices") and len(mesh.vertices) > vert_count:
+-            self._report(progress_cb, 85, "Optimizing mesh…")
++            self._report(
++                progress_cb,
++                85,
++                f"Optimizing {len(mesh.vertices):,} vertices to about {vert_count:,}…",
++            )
+             mesh = self._decimate(mesh, vert_count)
+ 
+-        self._report(progress_cb, 96, "Exporting GLB…")
++        if bool(params.get("preserve_color", True)):
++            self._report(progress_cb, 92, f"Baking colors from {len(reference_views)} views…")
++            mesh = self._apply_multiview_colors(mesh, reference_views)
++
++        self._report(progress_cb, 97, "Exporting color GLB…")
+         self.outputs_dir.mkdir(parents=True, exist_ok=True)
+         name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
+         path = self.outputs_dir / name
+@@ -149,68 +231,251 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+     # Helpers
+     # ------------------------------------------------------------------ #
+ 
++    def _apply_multiview_colors(self, mesh, views: dict[str, Image.Image]):
++        if len(views) == 1 and "front" in views:
++            return self._apply_reference_colors(mesh, views["front"])
++
++        try:
++            import numpy as np
++
++            vertices = np.asarray(mesh.vertices)
++            normals = np.asarray(mesh.vertex_normals)
++            if vertices.ndim != 2 or len(vertices) == 0:
++                return mesh
++
++            view_directions = {
++                "front": np.array([0.0, 0.0, 1.0]),
++                "back": np.array([0.0, 0.0, -1.0]),
++                "left": np.array([-1.0, 0.0, 0.0]),
++                "right": np.array([1.0, 0.0, 0.0]),
++                "top": np.array([0.0, 1.0, 0.0]),
++                "bottom": np.array([0.0, -1.0, 0.0]),
++            }
++            available = [view for view in view_directions if view in views]
++            direction_matrix = np.stack([view_directions[view] for view in available])
++            selected = np.argmax(normals @ direction_matrix.T, axis=1)
++
++            mins = vertices.min(axis=0)
++            spans = np.maximum(np.ptp(vertices, axis=0), 1e-8)
++            normalized = np.clip((vertices - mins) / spans, 0.0, 1.0)
++            result = np.zeros((len(vertices), 4), dtype=np.uint8)
++            result[:, 3] = 255
++
++            for view_index, view in enumerate(available):
++                vertex_indexes = np.flatnonzero(selected == view_index)
++                if len(vertex_indexes) == 0:
++                    continue
++                xyz = normalized[vertex_indexes]
++                if view == "front":
++                    u, v = xyz[:, 0], xyz[:, 1]
++                elif view == "back":
++                    u, v = 1.0 - xyz[:, 0], xyz[:, 1]
++                elif view == "left":
++                    u, v = xyz[:, 2], xyz[:, 1]
++                elif view == "right":
++                    u, v = 1.0 - xyz[:, 2], xyz[:, 1]
++                elif view == "top":
++                    u, v = xyz[:, 0], 1.0 - xyz[:, 2]
++                else:  # bottom
++                    u, v = xyz[:, 0], xyz[:, 2]
++                result[vertex_indexes] = self._sample_reference(views[view], u, v)
++
++            mesh.visual.vertex_colors = result
++            return mesh
++        except Exception as exc:
++            print(f"[Hunyuan3DMiniGenerator] Multi-view color bake skipped: {exc}")
++            primary = views.get("front") or next(iter(views.values()))
++            return self._apply_reference_colors(mesh, primary)
++
++    def _sample_reference(self, image: Image.Image, u, v):
++        import numpy as np
++
++        rgba = np.asarray(image.convert("RGBA"))
++        foreground = rgba[:, :, 3] > 16
++        if not foreground.any():
++            colors = np.full((len(u), 4), 255, dtype=np.uint8)
++            return colors
++
++        image_y, image_x = np.nonzero(foreground)
++        left, right = int(image_x.min()), int(image_x.max())
++        top, bottom = int(image_y.min()), int(image_y.max())
++        px = np.rint(left + np.clip(u, 0.0, 1.0) * max(right - left, 1)).astype(np.int32)
++        py = np.rint(bottom - np.clip(v, 0.0, 1.0) * max(bottom - top, 1)).astype(np.int32)
++        sampled = rgba[py, px].copy()
++        fallback = np.median(rgba[foreground, :3], axis=0).astype(np.uint8)
++        transparent = sampled[:, 3] <= 16
++        sampled[transparent, :3] = fallback
++        sampled[:, 3] = 255
++        return sampled
++
++    def _apply_reference_colors(self, mesh, image: Image.Image):
++        """Project reference-image color onto the mesh as embedded vertex colors.
++
++        Hunyuan3D Mini generates shape only. Vertex colors give Forgecast a
++        compact, texture-file-free color result that survives GLB export and is
++        understood by Three.js, Blender, Unity, Godot, and Unreal.
++        """
++        try:
++            import numpy as np
++
++            vertices = np.asarray(mesh.vertices)
++            if vertices.ndim != 2 or len(vertices) == 0:
++                return mesh
++
++            rgba = np.asarray(image.convert("RGBA"))
++            foreground = rgba[:, :, 3] > 16
++            if not foreground.any():
++                return mesh
++
++            image_y, image_x = np.nonzero(foreground)
++            left, right = int(image_x.min()), int(image_x.max())
++            top, bottom = int(image_y.min()), int(image_y.max())
++
++            x_min, y_min = vertices[:, 0].min(), vertices[:, 1].min()
++            x_span = max(float(np.ptp(vertices[:, 0])), 1e-8)
++            y_span = max(float(np.ptp(vertices[:, 1])), 1e-8)
++            u = np.clip((vertices[:, 0] - x_min) / x_span, 0.0, 1.0)
++            v = np.clip((vertices[:, 1] - y_min) / y_span, 0.0, 1.0)
++
++            px = np.rint(left + u * max(right - left, 1)).astype(np.int32)
++            py = np.rint(bottom - v * max(bottom - top, 1)).astype(np.int32)
++            sampled = rgba[py, px].copy()
++
++            # Silhouette differences can land a few vertices in transparent
++            # pixels. Fill those with the foreground median instead of black.
++            fallback = np.median(rgba[foreground, :3], axis=0).astype(np.uint8)
++            transparent = sampled[:, 3] <= 16
++            sampled[transparent, :3] = fallback
++            sampled[:, 3] = 255
++
++            mesh.visual.vertex_colors = sampled
++            return mesh
++        except Exception as exc:
++            print(f"[Hunyuan3DMiniGenerator] Reference color bake skipped: {exc}")
++            return mesh
++
++    def _remove_simple_background(self, img: Image.Image) -> Image.Image | None:
++        """Remove a connected light/neutral studio background without a model."""
++        try:
++            import cv2
++            import numpy as np
++
++            rgba = np.asarray(img.convert("RGBA")).copy()
++            rgb = rgba[:, :, :3]
++            channel_min = rgb.min(axis=2)
++            channel_max = rgb.max(axis=2)
++            candidate = (channel_min >= 205) & ((channel_max - channel_min) <= 28)
++
++            border = np.concatenate(
++                (candidate[0, :], candidate[-1, :], candidate[:, 0], candidate[:, -1])
++            )
++            if float(border.mean()) < 0.65:
++                return None
++
++            _count, labels = cv2.connectedComponents(candidate.astype(np.uint8), connectivity=8)
++            border_labels = np.unique(
++                np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
++            )
++            border_labels = border_labels[border_labels != 0]
++            if len(border_labels) == 0:
++                return None
++
++            background = np.isin(labels, border_labels)
++            if float(background.mean()) < 0.08:
++                return None
++
++            foreground = (~background).astype(np.uint8) * 255
++            alpha = cv2.GaussianBlur(foreground, (0, 0), 0.55)
++            rgba[:, :, 3] = alpha
++            return Image.fromarray(rgba, mode="RGBA")
++        except Exception as exc:
++            print(f"[Hunyuan3DMiniGenerator] Fast background removal skipped: {exc}")
++            return None
++
+     def _preprocess(self, image_bytes: bytes) -> Image.Image:
+-        import rembg
+         img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+         alpha_min, _alpha_max = img.getchannel("A").getextrema()
+         if alpha_min < 255:
+             return img
++
++        simple_result = self._remove_simple_background(img)
++        if simple_result is not None:
++            return simple_result
++
++        import rembg
++
++        # rembg 2.0.81 changed its implicit default to BRIA-RMBG 2.0, which
++        # downloads a 1+ GB checkpoint on the first opaque reference image.
++        # Our references are isolated game assets, so the compact U2Net-P
++        # model is both sufficient and dramatically faster to install/run.
++        if self._background_session is None:
++            self._background_session = rembg.new_session(
++                "u2netp",
++                providers=["CPUExecutionProvider"],
++            )
++        return rembg.remove(img, session=self._background_session).convert("RGBA")
++
++    def _prepare_shape_guide(self, image: Image.Image) -> Image.Image:
++        """Suppress painted micro-detail while preserving silhouette and hard edges.
++
++        Shape diffusion otherwise interprets hammered metal, leather grain, and
++        lighting noise as physical surface displacement. The untouched image is
++        still retained separately for the vertex-color bake.
++        """
+         try:
+-            return rembg.remove(img).convert("RGBA")
+-        except Exception:
+-            # cuDNN/CUDA incompatibility — fall back to CPU
+-            session = rembg.new_session("u2net", providers=["CPUExecutionProvider"])
+-            return rembg.remove(img, session=session).convert("RGBA")
++            import cv2
++            import numpy as np
++
++            rgba = np.asarray(image.convert("RGBA")).copy()
++            rgb = rgba[:, :, :3]
++            height, width = rgb.shape[:2]
++
++            # A modest area downsample removes sub-pixel grain; bilateral
++            # filtering then smooths material variation without erasing the
++            # strong chamfer, crystal, rune, and silhouette boundaries.
++            scale = min(1.0, 768.0 / max(height, width))
++            work_width = max(64, int(round(width * scale)))
++            work_height = max(64, int(round(height * scale)))
++            work = cv2.resize(rgb, (work_width, work_height), interpolation=cv2.INTER_AREA)
++            work = cv2.bilateralFilter(work, d=9, sigmaColor=48, sigmaSpace=7)
++            softened = cv2.resize(work, (width, height), interpolation=cv2.INTER_CUBIC)
++            rgba[:, :, :3] = softened
++            return Image.fromarray(rgba, mode="RGBA")
++        except Exception as exc:
++            print(f"[Hunyuan3DMiniGenerator] Shape-guide cleanup skipped: {exc}")
++            return image
+ 
+     def _decimate(self, mesh, target_vertices: int):
+         target_faces = max(4, target_vertices * 2)
++        started = time.time()
+         try:
+             simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+         except Exception as exc:
+             print(f"[Hunyuan3DMiniGenerator] Decimation skipped: {exc}")
+             return mesh
+-
+-        if simplified.is_watertight:
+-            return simplified
+-
+-        try:
+-            import pymeshlab
+-            import trimesh
+-
+-            mesh_set = pymeshlab.MeshSet()
+-            mesh_set.add_mesh(pymeshlab.Mesh(
+-                vertex_matrix=simplified.vertices,
+-                face_matrix=simplified.faces,
+-            ))
+-            mesh_set.apply_filter("meshing_repair_non_manifold_edges", method=0)
+-            mesh_set.apply_filter(
+-                "meshing_close_holes",
+-                maxholesize=1000,
+-                selfintersection=True,
+-            )
+-            repaired = mesh_set.current_mesh()
+-            result = trimesh.Trimesh(
+-                vertices=repaired.vertex_matrix(),
+-                faces=repaired.face_matrix(),
+-                process=True,
+-            )
+-            return result if result.is_watertight else simplified
+-        except Exception as exc:
+-            print(f"[Hunyuan3DMiniGenerator] Watertight repair skipped: {exc}")
+-            return simplified
++        print(
++            "[Hunyuan3DMiniGenerator] Decimated "
++            f"to {len(simplified.vertices):,} vertices / {len(simplified.faces):,} faces "
++            f"in {time.time() - started:.1f}s."
++        )
++        # Watertight/self-intersection repair is intentionally not performed
++        # here. It is expensive on high-detail meshes and is unnecessary for
++        # a real-time GLB. Print repair belongs in the STL export path.
++        return simplified
+ 
+     def _download_weights(self) -> None:
+         from huggingface_hub import snapshot_download
+-        print(f"[Hunyuan3DMiniGenerator] Downloading {_HF_REPO_ID} (base variant)…")
++        subfolder = self._model_subfolder()
++        repo_id = getattr(self, "hf_repo", None) or _HF_REPO_ID
++        print(f"[Hunyuan3DMiniGenerator] Downloading {repo_id}/{subfolder}…")
+         snapshot_download(
+-            repo_id=_HF_REPO_ID,
++            repo_id=repo_id,
+             local_dir=str(self.model_dir),
+-            ignore_patterns=[
+-                "hunyuan3d-dit-v2-mini-fast/**",
+-                "hunyuan3d-dit-v2-mini-turbo/**",
+-                "hunyuan3d-vae-v2-mini-turbo/**",
+-                "hunyuan3d-vae-v2-mini-withencoder/**",
+-                "*.md", "LICENSE", "NOTICE", ".gitattributes",
++            allow_patterns=[
++                f"{subfolder}/config.yaml",
++                f"{subfolder}/model.fp16.safetensors",
++                "LICENSE",
++                "NOTICE",
+             ],
+         )
+         print("[Hunyuan3DMiniGenerator] Download complete.")
+@@ -223,6 +488,9 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+             pass
+ 
+         src_dir = self.model_dir / "_hy3dgen"
++        shared_src_dir = self.model_dir.parent / "generate" / "_hy3dgen"
++        if not (src_dir / "hy3dgen").exists() and (shared_src_dir / "hy3dgen").exists():
++            src_dir = shared_src_dir
+         if not (src_dir / "hy3dgen").exists():
+             self._download_hy3dgen(src_dir)
+ 

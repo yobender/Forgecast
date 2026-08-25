@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.playwright-cli/
+output/
+scripts/__pycache__/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+.runtime/
