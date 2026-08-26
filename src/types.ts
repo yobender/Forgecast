@@ -8,6 +8,7 @@ export type MaterialMode = 'shape-only' | 'pbr'
 export type ReferenceImageSet = Partial<Record<ReferenceView, File>>
 export type RealEngineId = 'hunyuan-mini' | 'hunyuan-2.1' | 'trellis-2'
 export type PerformanceMode = 'laptop' | 'desktop'
+export type PrintRefineProfile = 'balanced' | 'fine'
 
 export interface CastSettings {
   prompt: string
@@ -19,6 +20,8 @@ export interface CastSettings {
   referenceFusion?: ReferenceFusionMode
   engineId?: RealEngineId
   performanceMode?: PerformanceMode
+  printHeightMm?: number
+  printRefineProfile?: PrintRefineProfile
 }
 
 export interface CastRecord extends CastSettings {

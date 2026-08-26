@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,11 +8,13 @@ import { fileURLToPath } from 'node:url'
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runtimeRoot = join(projectRoot, '.runtime')
 const logsRoot = join(runtimeRoot, 'logs')
+const printExportsRoot = join(runtimeRoot, 'print-exports')
 const statePath = join(runtimeRoot, 'active-engine.json')
 const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 const port = 8764
 
 mkdirSync(logsRoot, { recursive: true })
+mkdirSync(printExportsRoot, { recursive: true })
 
 const detectHardware = () => {
   try {
@@ -138,10 +141,93 @@ const readBody = (request) => new Promise((resolveBody, rejectBody) => {
   request.on('error', rejectBody)
 })
 
+const runProcess = (executable, args, timeoutMs = 5 * 60 * 1000) => new Promise((resolveRun, rejectRun) => {
+  const child = spawn(executable, args, { cwd: projectRoot, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); if (stdout.length > 128_000) stdout = stdout.slice(-128_000) })
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); if (stderr.length > 128_000) stderr = stderr.slice(-128_000) })
+  const timeout = setTimeout(() => {
+    child.kill()
+    rejectRun(new Error('STL refinement timed out after five minutes'))
+  }, timeoutMs)
+  child.once('error', (error) => { clearTimeout(timeout); rejectRun(error) })
+  child.once('exit', (code) => {
+    clearTimeout(timeout)
+    if (code === 0) resolveRun({ stdout, stderr })
+    else rejectRun(new Error((stderr || stdout || `Print refiner exited with code ${code}`).trim()))
+  })
+})
+
+const purgeOldPrintExports = () => {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000
+  for (const filename of readdirSync(printExportsRoot)) {
+    if (!/^[a-f0-9-]+\.stl$/i.test(filename)) continue
+    const outputPath = join(printExportsRoot, filename)
+    if (statSync(outputPath).mtimeMs < cutoff) unlinkSync(outputPath)
+  }
+}
+
+const refinePrintStl = async (body) => {
+  purgeOldPrintExports()
+  const sourceUrl = new URL(String(body.sourceUrl || ''))
+  const allowedPorts = new Set(['8765', '8081', '8766'])
+  if (sourceUrl.protocol !== 'http:' || sourceUrl.hostname !== '127.0.0.1' || !allowedPorts.has(sourceUrl.port)) {
+    throw new Error('Print refinement only accepts output from a local Forgecast engine')
+  }
+  const heightMm = Math.max(10, Math.min(500, Number(body.heightMm) || 75))
+  const profile = body.profile === 'balanced' ? 'balanced' : 'fine'
+  const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(60_000) })
+  if (!response.ok) throw new Error(`Could not read generated mesh: ${response.status} ${response.statusText}`)
+  const declaredSize = Number(response.headers.get('content-length') || 0)
+  if (declaredSize > 200 * 1024 * 1024) throw new Error('Generated mesh is larger than the 200 MB refinement limit')
+  const meshBytes = Buffer.from(await response.arrayBuffer())
+  if (meshBytes.length > 200 * 1024 * 1024) throw new Error('Generated mesh is larger than the 200 MB refinement limit')
+
+  const jobId = randomUUID()
+  const inputPath = join(printExportsRoot, `${jobId}.glb`)
+  const outputName = `${jobId}.stl`
+  const outputPath = join(printExportsRoot, outputName)
+  const python = join(runtimeRoot, 'modly', 'api', '.venv', 'Scripts', 'python.exe')
+  const script = join(projectRoot, 'backend', 'print_refine.py')
+  if (!existsSync(python) || !existsSync(script)) throw new Error('Print refinement dependencies are not installed')
+  writeFileSync(inputPath, meshBytes)
+  try {
+    const { stdout } = await runProcess(python, [script, '--input', inputPath, '--output', outputPath, '--height-mm', String(heightMm), '--profile', profile])
+    const statsLine = stdout.split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{'))
+    const stats = statsLine ? JSON.parse(statsLine) : { heightMm, profile }
+    return { url: `/exports/${outputName}`, stats }
+  } finally {
+    try { unlinkSync(inputPath) } catch { /* Temporary input may already be gone. */ }
+  }
+}
+
 const server = createServer(async (request, response) => {
   if (request.method === 'OPTIONS') return sendJson(response, 204, {})
   if (request.method === 'GET' && request.url === '/health') return sendJson(response, 200, { status: 'healthy' })
   if (request.method === 'GET' && request.url === '/engines') return sendJson(response, 200, engineState())
+  if (request.method === 'GET' && request.url?.startsWith('/exports/')) {
+    const outputName = request.url.slice('/exports/'.length)
+    if (!/^[a-f0-9-]+\.stl$/i.test(outputName)) return sendJson(response, 400, { error: 'Invalid export name' })
+    const outputPath = join(printExportsRoot, outputName)
+    if (!existsSync(outputPath)) return sendJson(response, 404, { error: 'Export not found' })
+    response.writeHead(200, {
+      'Content-Type': 'model/stl',
+      'Content-Disposition': `attachment; filename="forgecast-refined.stl"`,
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    })
+    return createReadStream(outputPath).pipe(response)
+  }
+  if (request.method === 'POST' && request.url === '/refine-stl') {
+    try {
+      const result = await refinePrintStl(JSON.parse(await readBody(request)))
+      return sendJson(response, 200, result)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return sendJson(response, 500, { error: message.length > 1000 ? `${message.slice(0, 997)}…` : message })
+    }
+  }
   if (request.method === 'POST' && request.url === '/deactivate') {
     try {
       activation = activation.catch(() => undefined).then(() => stopWorker())

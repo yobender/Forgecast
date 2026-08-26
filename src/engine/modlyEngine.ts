@@ -7,6 +7,9 @@ const API_BASE = 'http://127.0.0.1:8765'
 const SINGLE_MODEL_ID = 'hunyuan3d-mini/generate'
 const MULTI_MODEL_ID = 'hunyuan3d-mini/multiview'
 
+export const miniVertexBudget = (materialMode: CastSettings['materialMode'], targetTriangles: number) =>
+  materialMode === 'shape-only' ? 0 : Math.round(targetTriangles / 2)
+
 export interface RealEngineStatus {
   apiOnline: boolean
   modelAvailable: boolean
@@ -75,6 +78,7 @@ export async function generateRealMesh(
   const useFrontPriority = useMultiView && settings.referenceFusion !== 'full' && Boolean(images.front)
   const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
   const targetTriangles = qualityProfile.triangles
+  const printOutput = settings.materialMode === 'shape-only'
   if (useMultiView && !useFrontPriority) suppliedViews.forEach(([view, file]) => form.append(view, file))
   else form.append('image', images.front ?? suppliedViews[0][1])
   form.append('model_id', useMultiView && !useFrontPriority ? MULTI_MODEL_ID : SINGLE_MODEL_ID)
@@ -89,8 +93,10 @@ export async function generateRealMesh(
     // A closed triangle mesh generally has about two faces per vertex.
     // Respect the selected quality instead of silently forcing every
     // Polygon-game cast down to the 5K-triangle preview budget.
-    vertex_count: Math.round(targetTriangles / 2),
-    preserve_color: settings.materialMode !== 'shape-only',
+    // STL refinement needs the raw reconstruction. Decimating here cannot be
+    // undone later and was erasing engraved lines, fingers, straps and edges.
+    vertex_count: miniVertexBudget(settings.materialMode, targetTriangles),
+    preserve_color: !printOutput,
     // Feed the shape network an edge-preserving, texture-softened copy while
     // retaining the untouched references for the color bake. This prevents
     // hammered metal and leather grain from becoming melted mesh noise.

@@ -68,6 +68,10 @@ h1, h2 { margin: 5px 0 0; letter-spacing: -.035em; font-weight: 600; } h1 { font
 .style-card--1 .style-card__swatch { background: linear-gradient(145deg, #e0ad57 0 35%, #4f967d 35% 68%, #263c38 68%); }.style-card--2 .style-card__swatch { background: linear-gradient(145deg, #8e6b50, #33271f); }.style-card--3 .style-card__swatch { background: linear-gradient(145deg, #dca74e, #277d80 55%, #162934); }.style-card--4 .style-card__swatch { background: linear-gradient(145deg, #8dcc72 0 45%, #334c34 45%); }.style-card--5 .style-card__swatch { background: linear-gradient(145deg, #8d4235, #1e2630 55%); }.style-card--6 .style-card__swatch { background: linear-gradient(145deg, #7779ef, #ed8d58); }
 .baked-style-note { margin-top: 6px; height: 24px; border: 1px solid rgba(92,224,192,.18); border-radius: 6px; color: #7fc7b6; background: rgba(92,224,192,.055); display: flex; align-items: center; gap: 6px; padding: 0 8px; font: 8px 'DM Mono', monospace; }
 .settings-row { display: grid; grid-template-columns: 1fr 106px; gap: 8px; }
+.print-settings-row { grid-template-columns: 106px 1fr; }
+.print-size-input { position: relative; }
+.print-size-input .seed-input { padding-right: 28px; }
+.print-size-input span { position: absolute; right: 9px; top: 9px; color: #66716f; font: 9px 'DM Mono', monospace; pointer-events: none; }
 .select-wrap { position: relative; }.select-wrap svg { position: absolute; right: 8px; top: 10px; pointer-events: none; color: #6d7877; }
 select, .seed-input { width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 7px; color: #bec5c3; background: #111516; padding: 0 10px; font-size: 10px; outline: none; }
 select { appearance: none; padding-right: 28px; }.seed-input { font-family: 'DM Mono', monospace; }

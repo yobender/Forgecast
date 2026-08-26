@@ -11,7 +11,7 @@ import { buildStyleConditioning } from './engine/styleRecipes'
 import { loadHistory, saveHistory } from './lib/history'
 import { slugify } from './lib/naming'
 import { HUNYUAN_PBR_HINTS, miniQualityProfile, QUALITY_LABELS, STYLE_LABELS } from './lib/presets'
-import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshQuality, PerformanceMode, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
+import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshQuality, PerformanceMode, PrintRefineProfile, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
 
 const DEFAULT_PROMPT = ''
 const REFERENCE_VIEWS: ReferenceView[] = ['front', 'back', 'left', 'right', 'top', 'bottom']
@@ -19,6 +19,7 @@ const DROP_ORDER: ReferenceView[] = ['front', 'left', 'right', 'back', 'top', 'b
 const SHAPE_VIEWS = new Set<ReferenceView>(['front', 'left', 'back', 'right'])
 const DEV_MODEL_URL = window.location.port === '5173' ? new URLSearchParams(window.location.search).get('model') ?? '' : ''
 const DEFAULT_ENGINE: RealEngineId = 'hunyuan-mini'
+const PRINT_SERVICE_BASE = 'http://127.0.0.1:8764'
 const savedEngine = (): RealEngineId => {
   const value = localStorage.getItem('forgecast-engine')
   return value && Object.hasOwn(REAL_ENGINE_DEFINITIONS, value) ? value as RealEngineId : DEFAULT_ENGINE
@@ -68,6 +69,8 @@ export default function App() {
   const [quality, setQuality] = useState<MeshQuality>('balanced')
   const [seed, setSeed] = useState(483921)
   const [materialMode, setMaterialMode] = useState<MaterialMode>('pbr')
+  const [printHeightMm, setPrintHeightMm] = useState(75)
+  const [printRefineProfile, setPrintRefineProfile] = useState<PrintRefineProfile>('fine')
   const [selectedEngine, setSelectedEngine] = useState<RealEngineId>(savedEngine)
   const [performanceSetting, setPerformanceSetting] = useState<PerformanceSetting>(savedPerformance)
   const [stage, setStage] = useState<GenerationStage>(DEV_MODEL_URL ? 'complete' : 'idle')
@@ -85,6 +88,7 @@ export default function App() {
   const [generationError, setGenerationError] = useState('')
   const [engineStatuses, setEngineStatuses] = useState<UnifiedEngineStatuses>(initialEngineStatuses)
   const [releasingGpu, setReleasingGpu] = useState(false)
+  const [refiningStl, setRefiningStl] = useState(false)
   const viewerRef = useRef<AssetViewerHandle>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const batchFileInputRef = useRef<HTMLInputElement>(null)
@@ -238,7 +242,7 @@ export default function App() {
   }
 
   const statusText = useMemo(() => {
-    if (/GPU (memory|worker)/i.test(engineMessage)) return engineMessage
+    if (/GPU (memory|worker)|^(Refining STL|STL ready)/i.test(engineMessage)) return engineMessage
     if (stage === 'idle') return realEngine.ready ? `${engineDefinition.name} ready` : 'Demo preview ready'
     if (stage === 'complete') return modelUrl ? 'Real asset generated locally' : 'Demo preview complete · no AI model generated'
     return engineMessage || `Simulating ${stage} stage`
@@ -268,7 +272,7 @@ export default function App() {
       return
     }
     const runRealEngine = realEngine.ready && referenceCount > 0
-    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine, performanceMode: resolvedPerformance }
+    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine, performanceMode: resolvedPerformance, printHeightMm, printRefineProfile }
     const previousModelUrl = modelUrl
     setProgress(1)
     setStage('concept')
@@ -315,6 +319,8 @@ export default function App() {
     setQuality(record.quality)
     setSeed(record.seed)
     setMaterialMode(record.materialMode ?? 'pbr')
+    setPrintHeightMm(record.printHeightMm ?? 75)
+    setPrintRefineProfile(record.printRefineProfile ?? 'fine')
     if (record.performanceMode) setPerformanceSetting(record.performanceMode)
     setReferenceFusion(record.referenceFusion ?? 'front-priority')
     if (record.engineId) setSelectedEngine(record.engineId)
@@ -333,6 +339,8 @@ export default function App() {
       seed,
       materialMode,
       performanceMode: resolvedPerformance,
+      printHeightMm,
+      printRefineProfile,
       referenceFusion,
       engine: modelUrl ? selectedEngine : 'mock',
       referenceViews: Object.keys(referenceFiles),
@@ -342,11 +350,46 @@ export default function App() {
     downloadBlob(new Blob([JSON.stringify(recipe, null, 2)], { type: 'application/json' }), `${slugify(prompt)}.forgecast.json`)
   }
 
-  const exportStl = () => {
+  const exportQuickStl = () => {
     const object = viewerRef.current?.getObject()
     if (!object) return
     const data = new STLExporter().parse(object, { binary: true })
     downloadBlob(new Blob([data], { type: 'model/stl' }), `${slugify(prompt)}.stl`)
+  }
+
+  const exportStl = async () => {
+    if (!modelUrl) {
+      exportQuickStl()
+      return
+    }
+    if (refiningStl) return
+    setRefiningStl(true)
+    setExportOpen(false)
+    setGenerationError('')
+    setEngineMessage('Refining STL geometry for printing…')
+    try {
+      const refinedResponse = await fetch(`${PRINT_SERVICE_BASE}/refine-stl`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceUrl: modelUrl, heightMm: printHeightMm, profile: printRefineProfile }),
+      })
+      if (!refinedResponse.ok) {
+        const message = await refinedResponse.json().catch(() => ({ error: refinedResponse.statusText })) as { error?: string }
+        throw new Error(message.error || 'STL refinement failed')
+      }
+      const result = await refinedResponse.json() as { url: string; stats?: { outputFaces?: number; removedComponents?: number; watertight?: boolean } }
+      const stlResponse = await fetch(`${PRINT_SERVICE_BASE}${result.url}`)
+      if (!stlResponse.ok) throw new Error('The refined STL could not be downloaded')
+      downloadBlob(await stlResponse.blob(), `${slugify(prompt)}-${printHeightMm}mm-${printRefineProfile}.stl`)
+      const faces = result.stats?.outputFaces ? `${result.stats.outputFaces.toLocaleString()} faces` : 'refined geometry'
+      const solidity = result.stats?.watertight ? 'watertight' : 'slicer repair may still be needed'
+      setEngineMessage(`STL ready · ${faces} · ${printHeightMm} mm · ${solidity}`)
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : 'STL refinement failed')
+      setEngineMessage('')
+    } finally {
+      setRefiningStl(false)
+    }
   }
 
   const exportGlb = () => {
@@ -447,7 +490,11 @@ export default function App() {
           </div>
 
           <div className="field-group settings-row">
-            <div><label>{selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' ? 'Cast quality' : 'Mesh quality'}</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => <option value={key} key={key}>{QUALITY_LABELS[key].label} · {(selectedEngine === 'hunyuan-mini' ? miniQualityProfile(key, laptopMode).triangles : QUALITY_LABELS[key].triangles) / 1000}K</option>)}</select><ChevronDown size={14} /></div></div>
+            <div><label>{selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' ? 'Cast quality' : 'Mesh quality'}</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => {
+              const mini = miniQualityProfile(key, laptopMode)
+              const detail = selectedEngine === 'hunyuan-mini' && materialMode === 'shape-only' ? `raw · ${mini.octreeResolution} grid` : `${(selectedEngine === 'hunyuan-mini' ? mini.triangles : QUALITY_LABELS[key].triangles) / 1000}K`
+              return <option value={key} key={key}>{QUALITY_LABELS[key].label} · {detail}</option>
+            })}</select><ChevronDown size={14} /></div></div>
             <div><label>Seed</label><input className="seed-input" value={seed} onChange={(event) => setSeed(Number(event.target.value))} type="number" /></div>
           </div>
 
@@ -459,23 +506,29 @@ export default function App() {
               <button className={materialMode === 'pbr' ? 'active' : ''} type="button" disabled={selectedEngine === 'hunyuan-2.1' && realEngine.paintAvailable === false} onClick={() => setMaterialMode('pbr')}>{selectedEngine === 'hunyuan-mini' ? 'Color asset' : 'PBR color'}</button>
               <button className={materialMode === 'shape-only' ? 'active' : ''} type="button" onClick={() => setMaterialMode('shape-only')}>{selectedEngine === 'hunyuan-mini' ? 'Print STL' : 'Shape only'}</button>
             </div>
-            <small>{materialMode === 'pbr' ? (selectedEngine === 'hunyuan-mini' ? `${liveTextureSize / 1024}K live detail materials; GLB export is prepared at 2K.` : 'Generates shape, frees VRAM, then paints UV-aligned albedo and metallic/roughness maps.') : 'Faster geometry-only output for STL printing or manual materials.'}</small>
+            <small>{materialMode === 'pbr' ? (selectedEngine === 'hunyuan-mini' ? `${liveTextureSize / 1024}K live detail materials; GLB export is prepared at 2K.` : 'Generates shape, frees VRAM, then paints UV-aligned albedo and metallic/roughness maps.') : 'Keeps the raw reconstruction instead of decimating it, then repairs and scales the mesh during STL export.'}</small>
           </div>}
+
+          {materialMode === 'shape-only' && <div className="field-group settings-row print-settings-row">
+            <div><label>Print height</label><div className="print-size-input"><input className="seed-input" value={printHeightMm} min={10} max={500} step={1} onChange={(event) => setPrintHeightMm(Math.max(10, Math.min(500, Number(event.target.value) || 10)))} type="number" /><span>mm</span></div></div>
+            <div><label>STL refinement</label><div className="select-wrap"><select value={printRefineProfile} onChange={(event) => setPrintRefineProfile(event.target.value as PrintRefineProfile)}><option value="fine">Fine detail</option><option value="balanced">Balanced cleanup</option></select><ChevronDown size={14} /></div></div>
+          </div>}
+          {materialMode === 'shape-only' && <div className="baked-style-note"><Sparkles size={12} /> Fine detail preserves smaller disconnected features; both modes repair holes, normals and floating fragments before export.</div>}
 
           {desktopEngineBlocked && <div className="baked-style-note"><Cpu size={12} /> Desktop-only engine blocked by Laptop safe mode. Use Hunyuan Mini here, or explicitly choose Desktop full to override.</div>}
 
           <div className={`engine-note ${realEngine.ready ? 'engine-note--ready' : ''}`}><Cpu size={16} /><span><strong>{realEngine.ready ? (referenceCount > 1 ? (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? 'Front-only generation ready' : multiViewInstalling ? 'Multi-view model is installing' : `${shapeReferenceCount}-view full fusion ready`) : referenceFiles.front ? `${engineDefinition.shortName} ready` : 'Add a front reference') : engineStarting ? `${engineDefinition.shortName} is starting` : 'Demo mode only — prompts are not generated'}</strong><small>{realEngine.ready ? (referenceCount > 1 && (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView) ? 'Uses the front reference; other loaded slots are ignored by this engine.' : realEngine.detail) : engineStarting ? 'The engine manager is switching workers. This usually takes a few seconds; model weights load on the first cast.' : `${realEngine.label}. ${realEngine.detail}`}</small></span></div>
           {generationError && <div className="generation-error">{generationError}</div>}
 
-          <button className="cast-button" onClick={startCast} disabled={running || multiViewInstalling || engineStarting || hunyuanPaintBlocked || desktopEngineBlocked}>
+          <button className="cast-button" onClick={startCast} disabled={running || refiningStl || multiViewInstalling || engineStarting || hunyuanPaintBlocked || desktopEngineBlocked}>
             {running ? <><RefreshCw className="spin" size={18} /> {realEngine.ready ? 'GENERATING' : 'SIMULATING'} · {progress}%</> : <><WandSparkles size={19} /> {desktopEngineBlocked ? 'DESKTOP ENGINE · CHANGE PROFILE' : engineStarting ? 'STARTING ENGINE' : realEngine.ready ? (multiViewInstalling ? 'INSTALLING MULTI-VIEW MODEL' : referenceCount > 1 ? (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : `FUSE ${referenceCount} REFERENCES`) : referenceFiles.front ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : 'ADD FRONT REFERENCE') : (stage === 'complete' ? 'RE-RUN DEMO' : 'RUN DEMO PREVIEW')}</>}
           </button>
         </aside>
 
         <section className="viewer-panel">
           <div className="viewer-toolbar">
-            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {displayTriangles.toLocaleString()} tris</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? `${liveTextureSize / 1024}K live PBR` : 'Print geometry'}</span>}</div>
-            <div><button className="tool-button" disabled={running || releasingGpu || !realEngine.online} onClick={releaseGpu}><Cpu size={15} /> {releasingGpu ? 'Releasing…' : 'Free GPU'}</button><button className={`tool-button ${autoRotate ? 'active' : ''}`} onClick={() => setAutoRotate((value) => !value)}><Rotate3D size={15} /> {autoRotate ? 'Rotating' : 'Orbit'}</button><button className={`tool-button ${wireframe ? 'active' : ''}`} onClick={() => setWireframe((value) => !value)}>Wireframe</button></div>
+            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {materialMode === 'shape-only' ? 'Raw detail mesh' : `${displayTriangles.toLocaleString()} tris`}</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? `${liveTextureSize / 1024}K live PBR` : `${printHeightMm} mm print`}</span>}</div>
+            <div><button className="tool-button" disabled={running || refiningStl || releasingGpu || !realEngine.online} onClick={releaseGpu}><Cpu size={15} /> {releasingGpu ? 'Releasing…' : 'Free GPU'}</button><button className={`tool-button ${autoRotate ? 'active' : ''}`} onClick={() => setAutoRotate((value) => !value)}><Rotate3D size={15} /> {autoRotate ? 'Rotating' : 'Orbit'}</button><button className={`tool-button ${wireframe ? 'active' : ''}`} onClick={() => setWireframe((value) => !value)}>Wireframe</button></div>
           </div>
           <div className="viewer-canvas">{!modelUrl && <div className="demo-watermark"><strong>DEMO GEOMETRY</strong><span>Not generated from your prompt</span></div>}<AssetViewer ref={viewerRef} type={assetType} style={style} wireframe={wireframe} autoRotate={autoRotate} modelUrl={modelUrl || undefined} detailTextureSize={liveTextureSize} proceduralPbr={materialMode === 'pbr'} /></div>
           <div className="viewer-caption"><span>Drag to orbit · Scroll to zoom · Right-drag to pan</span><span>{modelUrl ? 'Real local AI output' : 'Procedural demo geometry'}</span></div>
@@ -487,8 +540,8 @@ export default function App() {
             </div>
             <div className="progress-wrap"><StageRail stage={stage} /><div className="progress-track"><span style={{ width: `${progress}%` }} /></div></div>
             <div className="export-wrap">
-              <button className="export-button" disabled={stage !== 'complete'} onClick={() => setExportOpen((value) => !value)}><Download size={16} /> Export <ChevronDown size={14} /></button>
-              {exportOpen && <div className="export-menu"><button onClick={exportGlb}>{hasPbrOutput ? '2K PBR Color GLB' : modelUrl ? 'Geometry GLB' : 'Demo GLB'} <span>{hasPbrOutput ? 'Temporarily builds final 2K material maps' : modelUrl ? 'Mesh with its generated material data' : 'Procedural colors'}</span></button><button onClick={exportStl}>{modelUrl ? 'Print STL' : 'Demo STL'} <span>Geometry only · no color</span></button><button onClick={exportRecipe}>Recipe <span>Prompt + settings</span></button><button disabled>FBX <span>Coming later</span></button></div>}
+              <button className="export-button" disabled={stage !== 'complete' || refiningStl} onClick={() => setExportOpen((value) => !value)}><Download size={16} /> {refiningStl ? 'Refining STL…' : 'Export'} <ChevronDown size={14} /></button>
+              {exportOpen && <div className="export-menu"><button onClick={exportGlb}>{hasPbrOutput ? '2K PBR Color GLB' : modelUrl ? 'Geometry GLB' : 'Demo GLB'} <span>{hasPbrOutput ? 'Temporarily builds final 2K material maps' : modelUrl ? 'Mesh with its generated material data' : 'Procedural colors'}</span></button><button onClick={() => { void exportStl() }}>{modelUrl ? 'Refined Print STL' : 'Demo STL'} <span>{modelUrl ? `${printHeightMm} mm · repair holes, normals and floaters` : 'Geometry only · no color'}</span></button><button onClick={exportRecipe}>Recipe <span>Prompt + settings</span></button><button disabled>FBX <span>Coming later</span></button></div>}
             </div>
           </div>
         </section>
