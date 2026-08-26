@@ -72,12 +72,13 @@ index 46e0a46..7e4772c 100644
          params: dict,
          progress_cb: Optional[Callable[[int, str], None]] = None,
          cancel_event: Optional[threading.Event] = None,
-@@ -96,20 +122,68 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+@@ -96,20 +122,69 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
          vert_count       = int(params.get("vertex_count", 0))
          octree_res       = int(params.get("octree_resolution", 380))
          guidance_scale   = float(params.get("guidance_scale", 5.5))
 +        clean_shape_guides = bool(params.get("clean_shape_guides", False))
 +        shape_source     = str(params.get("shape_source", "all"))
++        shape_guide_profile = str(params.get("shape_guide_profile", "detail"))
          seed             = int(params.get("seed", -1))
          if seed == -1:
              seed = random.randint(0, 2**32 - 1)
@@ -103,7 +104,7 @@ index 46e0a46..7e4772c 100644
 +                )
 +            shape_views = {
 +                view: (
-+                    self._prepare_shape_guide(reference_views[view])
++                    self._prepare_shape_guide(reference_views[view], shape_guide_profile)
 +                    if clean_shape_guides
 +                    else reference_views[view]
 +                )
@@ -123,7 +124,7 @@ index 46e0a46..7e4772c 100644
 +            primary_image = self._preprocess(image_bytes)
 +            reference_views = {"front": primary_image}
 +            image = (
-+                self._prepare_shape_guide(primary_image)
++                self._prepare_shape_guide(primary_image, shape_guide_profile)
 +                if clean_shape_guides
 +                else primary_image
 +            )
@@ -145,7 +146,7 @@ index 46e0a46..7e4772c 100644
                  daemon=True,
              )
              t.start()
-@@ -133,10 +207,18 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+@@ -133,10 +208,18 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
          self._check_cancelled(cancel_event)
  
          if vert_count > 0 and hasattr(mesh, "vertices") and len(mesh.vertices) > vert_count:
@@ -166,7 +167,7 @@ index 46e0a46..7e4772c 100644
          self.outputs_dir.mkdir(parents=True, exist_ok=True)
          name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
          path = self.outputs_dir / name
-@@ -149,68 +231,251 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+@@ -149,68 +232,274 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
      # Helpers
      # ------------------------------------------------------------------ #
  
@@ -355,12 +356,12 @@ index 46e0a46..7e4772c 100644
 +            )
 +        return rembg.remove(img, session=self._background_session).convert("RGBA")
 +
-+    def _prepare_shape_guide(self, image: Image.Image) -> Image.Image:
-+        """Suppress painted micro-detail while preserving silhouette and hard edges.
++    def _prepare_shape_guide(self, image: Image.Image, profile: str = "detail") -> Image.Image:
++        """Prepare a geometry-specific conditioning image for shape diffusion.
 +
-+        Shape diffusion otherwise interprets hammered metal, leather grain, and
-+        lighting noise as physical surface displacement. The untouched image is
-+        still retained separately for the vertex-color bake.
++        Profiles deliberately trade fine relief, edge definition, organic
++        smoothness, simplification, or stronger printable silhouettes. The
++        untouched reference is still retained for the vertex-color bake.
 +        """
          try:
 -            return rembg.remove(img).convert("RGBA")
@@ -375,16 +376,39 @@ index 46e0a46..7e4772c 100644
 +            rgb = rgba[:, :, :3]
 +            height, width = rgb.shape[:2]
 +
-+            # A modest area downsample removes sub-pixel grain; bilateral
-+            # filtering then smooths material variation without erasing the
-+            # strong chamfer, crystal, rune, and silhouette boundaries.
-+            scale = min(1.0, 768.0 / max(height, width))
++            settings = {
++                # Miniature relief must survive the conditioner's later resize.
++                # Keep the full portrait reference and remove only tiny noise.
++                "detail": (1536.0, 3, 18, 3),
++                "hard-surface": (1024.0, 7, 38, 5),
++                "organic": (768.0, 11, 60, 9),
++                "simplified": (512.0, 13, 72, 11),
++                "print-safe": (640.0, 11, 64, 9),
++            }
++            max_edge, diameter, sigma_color, sigma_space = settings.get(profile, settings["detail"])
++            scale = min(1.0, max_edge / max(height, width))
 +            work_width = max(64, int(round(width * scale)))
 +            work_height = max(64, int(round(height * scale)))
 +            work = cv2.resize(rgb, (work_width, work_height), interpolation=cv2.INTER_AREA)
-+            work = cv2.bilateralFilter(work, d=9, sigmaColor=48, sigmaSpace=7)
++            work = cv2.bilateralFilter(work, d=diameter, sigmaColor=sigma_color, sigmaSpace=sigma_space)
++            if profile == "detail":
++                lab = cv2.cvtColor(work, cv2.COLOR_RGB2LAB)
++                luminance, channel_a, channel_b = cv2.split(lab)
++                luminance = cv2.createCLAHE(clipLimit=1.45, tileGridSize=(12, 12)).apply(luminance)
++                work = cv2.cvtColor(cv2.merge((luminance, channel_a, channel_b)), cv2.COLOR_LAB2RGB)
++                blurred = cv2.GaussianBlur(work, (0, 0), 0.85)
++                work = cv2.addWeighted(work, 1.18, blurred, -0.18, 0)
++            elif profile == "hard-surface":
++                blurred = cv2.GaussianBlur(work, (0, 0), 1.2)
++                work = cv2.addWeighted(work, 1.28, blurred, -0.28, 0)
 +            softened = cv2.resize(work, (width, height), interpolation=cv2.INTER_CUBIC)
 +            rgba[:, :, :3] = softened
++            if profile == "print-safe":
++                foreground = (rgba[:, :, 3] > 16).astype(np.uint8) * 255
++                kernel = np.ones((3, 3), np.uint8)
++                foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel, iterations=2)
++                foreground = cv2.dilate(foreground, kernel, iterations=1)
++                rgba[:, :, 3] = foreground
 +            return Image.fromarray(rgba, mode="RGBA")
 +        except Exception as exc:
 +            print(f"[Hunyuan3DMiniGenerator] Shape-guide cleanup skipped: {exc}")
@@ -461,7 +485,7 @@ index 46e0a46..7e4772c 100644
              ],
          )
          print("[Hunyuan3DMiniGenerator] Download complete.")
-@@ -223,6 +488,9 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+@@ -223,6 +512,9 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
              pass
  
          src_dir = self.model_dir / "_hy3dgen"

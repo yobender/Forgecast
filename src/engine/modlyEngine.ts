@@ -1,14 +1,19 @@
 import type { CastSettings, ReferenceImageSet, ReferenceView } from '../types'
 import type { EngineProgress, EngineResult } from './contracts'
 import { miniQualityProfile } from '../lib/presets'
-import { buildStyleConditioning } from './styleRecipes'
+import { buildStyleConditioning, GEOMETRY_PRESETS } from './styleRecipes'
 
 const API_BASE = 'http://127.0.0.1:8765'
 const SINGLE_MODEL_ID = 'hunyuan3d-mini/generate'
 const MULTI_MODEL_ID = 'hunyuan3d-mini/multiview'
 
-export const miniVertexBudget = (materialMode: CastSettings['materialMode'], targetTriangles: number) =>
-  materialMode === 'shape-only' ? 0 : Math.round(targetTriangles / 2)
+export const miniVertexBudget = (
+  materialMode: CastSettings['materialMode'],
+  targetTriangles: number,
+  style: CastSettings['style'] = 'miniature-sculpt',
+) => materialMode === 'shape-only' && GEOMETRY_PRESETS[style].preserveRawPrintMesh
+  ? 0
+  : Math.round(targetTriangles / 2)
 
 export interface RealEngineStatus {
   apiOnline: boolean
@@ -77,7 +82,10 @@ export async function generateRealMesh(
   const useMultiView = suppliedViews.length > 1
   const useFrontPriority = useMultiView && settings.referenceFusion !== 'full' && Boolean(images.front)
   const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
-  const targetTriangles = qualityProfile.triangles
+  const geometryPreset = GEOMETRY_PRESETS[settings.style]
+  const targetTriangles = settings.materialMode === 'pbr' && settings.targetTriangles
+    ? settings.targetTriangles
+    : Math.max(4000, Math.round(qualityProfile.triangles * geometryPreset.targetTriangleRatio))
   const printOutput = settings.materialMode === 'shape-only'
   if (useMultiView && !useFrontPriority) suppliedViews.forEach(([view, file]) => form.append(view, file))
   else form.append('image', images.front ?? suppliedViews[0][1])
@@ -88,19 +96,20 @@ export async function generateRealMesh(
   form.append('params', JSON.stringify({
     num_inference_steps: qualityProfile.inferenceSteps,
     octree_resolution: qualityProfile.octreeResolution,
-    guidance_scale: 5.5,
+    guidance_scale: geometryPreset.guidanceScale,
     seed: settings.seed,
     // A closed triangle mesh generally has about two faces per vertex.
-    // Respect the selected quality instead of silently forcing every
-    // Polygon-game cast down to the 5K-triangle preview budget.
+    // Respect quality and the selected geometry preset instead of silently
+    // forcing every cast down to a preview-sized triangle budget.
     // STL refinement needs the raw reconstruction. Decimating here cannot be
     // undone later and was erasing engraved lines, fingers, straps and edges.
-    vertex_count: miniVertexBudget(settings.materialMode, targetTriangles),
+    vertex_count: miniVertexBudget(settings.materialMode, targetTriangles, settings.style),
     preserve_color: !printOutput,
     // Feed the shape network an edge-preserving, texture-softened copy while
     // retaining the untouched references for the color bake. This prevents
     // hammered metal and leather grain from becoming melted mesh noise.
-    clean_shape_guides: settings.quality === 'high',
+    clean_shape_guides: true,
+    shape_guide_profile: geometryPreset.guideProfile,
     shape_source: useFrontPriority ? 'front' : 'all',
   }))
 

@@ -13,6 +13,14 @@ describe('miniQualityProfile', () => {
     expect(miniQualityProfile('high', false)).toEqual({ triangles: 100000, inferenceSteps: 50, octreeResolution: 512 })
   })
 
+  it('offers a deliberately slower laptop ultra profile', () => {
+    const high = miniQualityProfile('high', true)
+    const ultra = miniQualityProfile('ultra', true)
+    expect(ultra.octreeResolution).toBe(448)
+    expect(ultra.inferenceSteps).toBeGreaterThan(high.inferenceSteps)
+    expect(ultra.triangles).toBeGreaterThan(high.triangles)
+  })
+
   it('keeps the raw reconstruction for STL casts but caps color assets', () => {
     expect(miniVertexBudget('shape-only', 75000)).toBe(0)
     expect(miniVertexBudget('pbr', 75000)).toBe(37500)

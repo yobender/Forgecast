@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,12 +9,15 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runtimeRoot = join(projectRoot, '.runtime')
 const logsRoot = join(runtimeRoot, 'logs')
 const printExportsRoot = join(runtimeRoot, 'print-exports')
+const libraryModelsRoot = join(runtimeRoot, 'library', 'models')
 const statePath = join(runtimeRoot, 'active-engine.json')
+const geometryPresets = new Set(['miniature-sculpt', 'hard-surface', 'organic', 'low-poly', 'print-safe'])
 const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 const port = 8764
 
 mkdirSync(logsRoot, { recursive: true })
 mkdirSync(printExportsRoot, { recursive: true })
+mkdirSync(libraryModelsRoot, { recursive: true })
 
 const detectHardware = () => {
   try {
@@ -61,7 +64,7 @@ const sendJson = (response, status, value) => {
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Cache-Control': 'no-store',
   })
@@ -171,12 +174,14 @@ const purgeOldPrintExports = () => {
 const refinePrintStl = async (body) => {
   purgeOldPrintExports()
   const sourceUrl = new URL(String(body.sourceUrl || ''))
-  const allowedPorts = new Set(['8765', '8081', '8766'])
-  if (sourceUrl.protocol !== 'http:' || sourceUrl.hostname !== '127.0.0.1' || !allowedPorts.has(sourceUrl.port)) {
+  const engineSource = ['8765', '8081', '8766'].includes(sourceUrl.port)
+  const librarySource = sourceUrl.port === String(port) && /^\/library\/models\/[a-f0-9-]+\.glb$/i.test(sourceUrl.pathname)
+  if (sourceUrl.protocol !== 'http:' || sourceUrl.hostname !== '127.0.0.1' || (!engineSource && !librarySource)) {
     throw new Error('Print refinement only accepts output from a local Forgecast engine')
   }
   const heightMm = Math.max(10, Math.min(500, Number(body.heightMm) || 75))
   const profile = body.profile === 'balanced' ? 'balanced' : 'fine'
+  const geometryPreset = geometryPresets.has(body.geometryPreset) ? body.geometryPreset : 'miniature-sculpt'
   const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(60_000) })
   if (!response.ok) throw new Error(`Could not read generated mesh: ${response.status} ${response.statusText}`)
   const declaredSize = Number(response.headers.get('content-length') || 0)
@@ -193,13 +198,89 @@ const refinePrintStl = async (body) => {
   if (!existsSync(python) || !existsSync(script)) throw new Error('Print refinement dependencies are not installed')
   writeFileSync(inputPath, meshBytes)
   try {
-    const { stdout } = await runProcess(python, [script, '--input', inputPath, '--output', outputPath, '--height-mm', String(heightMm), '--profile', profile])
+    const { stdout } = await runProcess(python, [script, '--input', inputPath, '--output', outputPath, '--height-mm', String(heightMm), '--profile', profile, '--geometry-preset', geometryPreset])
     const statsLine = stdout.split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{'))
     const stats = statsLine ? JSON.parse(statsLine) : { heightMm, profile }
     return { url: `/exports/${outputName}`, stats }
   } finally {
     try { unlinkSync(inputPath) } catch { /* Temporary input may already be gone. */ }
   }
+}
+
+const retainLibraryModel = async (body) => {
+  const sourceUrl = new URL(String(body.sourceUrl || ''))
+  if (sourceUrl.protocol !== 'http:' || sourceUrl.hostname !== '127.0.0.1' || !['8765', '8081', '8766'].includes(sourceUrl.port)) {
+    throw new Error('The library only retains output from a local Forgecast engine')
+  }
+  const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(90_000) })
+  if (!response.ok) throw new Error(`Could not read generated mesh: ${response.status} ${response.statusText}`)
+  const declaredSize = Number(response.headers.get('content-length') || 0)
+  if (declaredSize > 300 * 1024 * 1024) throw new Error('Generated mesh is larger than the 300 MB library limit')
+  const meshBytes = Buffer.from(await response.arrayBuffer())
+  if (meshBytes.length > 300 * 1024 * 1024) throw new Error('Generated mesh is larger than the 300 MB library limit')
+  const modelId = randomUUID()
+  const filename = `${modelId}.glb`
+  writeFileSync(join(libraryModelsRoot, filename), meshBytes)
+  return { id: modelId, url: `/library/models/${filename}`, bytes: meshBytes.length }
+}
+
+const inspectLibraryModel = async (filename) => {
+  const modelPath = join(libraryModelsRoot, filename)
+  if (!existsSync(modelPath)) throw new Error('Library model not found')
+  const cachePath = `${modelPath}.stats.json`
+  if (existsSync(cachePath) && statSync(cachePath).mtimeMs >= statSync(modelPath).mtimeMs) {
+    return JSON.parse(readFileSync(cachePath, 'utf8'))
+  }
+  const pythonCandidates = [
+    join(runtimeRoot, 'forgecast-engine', 'extensions', 'hunyuan3d-mini', 'venv', 'Scripts', 'python.exe'),
+    join(runtimeRoot, 'modly', 'api', '.venv', 'Scripts', 'python.exe'),
+    join(runtimeRoot, 'venvs', 'hunyuan3d-2.1', 'Scripts', 'python.exe'),
+  ]
+  const python = pythonCandidates.find((candidate) => existsSync(candidate))
+  const script = join(projectRoot, 'backend', 'mesh_inspect.py')
+  if (!python || !existsSync(script)) throw new Error('Mesh inspection dependencies are not installed')
+  const { stdout } = await runProcess(python, [script, '--input', modelPath], 60_000)
+  const statsLine = stdout.split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{'))
+  if (!statsLine) throw new Error('Mesh inspector returned no statistics')
+  const stats = JSON.parse(statsLine)
+  writeFileSync(cachePath, JSON.stringify(stats, null, 2))
+  return stats
+}
+
+const recoverLegacyModels = (body) => {
+  const casts = Array.isArray(body.casts) ? body.casts.slice(0, 50) : []
+  const outputRoots = [
+    join(runtimeRoot, 'forgecast-engine', 'workspace', 'Forgecast'),
+    join(runtimeRoot, 'forgecast-engine', 'hunyuan3d-2.1', 'outputs'),
+  ]
+  const candidates = outputRoots.flatMap((root) => {
+    if (!existsSync(root)) return []
+    return readdirSync(root)
+      .filter((filename) => /^[a-z0-9_-]+\.glb$/i.test(filename))
+      .map((filename) => {
+        const path = join(root, filename)
+        return { path, modifiedAt: statSync(path).mtimeMs }
+      })
+  })
+  const used = new Set()
+  const recovered = []
+  for (const cast of casts) {
+    if (typeof cast?.id !== 'string' || !/^[a-f0-9-]{8,}$/i.test(cast.id)) continue
+    const createdAt = Date.parse(String(cast.createdAt || ''))
+    if (!Number.isFinite(createdAt)) continue
+    const match = candidates
+      .filter((candidate) => !used.has(candidate.path))
+      .map((candidate) => ({ ...candidate, difference: Math.abs(candidate.modifiedAt - createdAt) }))
+      .filter((candidate) => candidate.difference <= 15 * 60 * 1000)
+      .sort((a, b) => a.difference - b.difference)[0]
+    if (!match) continue
+    used.add(match.path)
+    const modelId = randomUUID()
+    const filename = `${modelId}.glb`
+    copyFileSync(match.path, join(libraryModelsRoot, filename))
+    recovered.push({ castId: cast.id, url: `/library/models/${filename}` })
+  }
+  return { recovered }
 }
 
 const server = createServer(async (request, response) => {
@@ -218,6 +299,50 @@ const server = createServer(async (request, response) => {
       'Cache-Control': 'no-store',
     })
     return createReadStream(outputPath).pipe(response)
+  }
+  if (request.method === 'GET' && request.url?.startsWith('/library/models/')) {
+    const statsMatch = request.url.match(/^\/library\/models\/([a-f0-9-]+\.glb)\/stats$/i)
+    if (statsMatch) {
+      try {
+        return sendJson(response, 200, await inspectLibraryModel(statsMatch[1]))
+      } catch (error) {
+        return sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+    }
+    const filename = request.url.slice('/library/models/'.length)
+    if (!/^[a-f0-9-]+\.glb$/i.test(filename)) return sendJson(response, 400, { error: 'Invalid library model name' })
+    const modelPath = join(libraryModelsRoot, filename)
+    if (!existsSync(modelPath)) return sendJson(response, 404, { error: 'Library model not found' })
+    response.writeHead(200, {
+      'Content-Type': 'model/gltf-binary',
+      'Content-Length': statSync(modelPath).size,
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    })
+    return createReadStream(modelPath).pipe(response)
+  }
+  if (request.method === 'DELETE' && request.url?.startsWith('/library/models/')) {
+    const filename = request.url.slice('/library/models/'.length)
+    if (!/^[a-f0-9-]+\.glb$/i.test(filename)) return sendJson(response, 400, { error: 'Invalid library model name' })
+    const modelPath = join(libraryModelsRoot, filename)
+    if (existsSync(modelPath)) unlinkSync(modelPath)
+    if (existsSync(`${modelPath}.stats.json`)) unlinkSync(`${modelPath}.stats.json`)
+    return sendJson(response, 200, { deleted: true })
+  }
+  if (request.method === 'POST' && request.url === '/library/models') {
+    try {
+      return sendJson(response, 201, await retainLibraryModel(JSON.parse(await readBody(request))))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return sendJson(response, 500, { error: message.length > 1000 ? `${message.slice(0, 997)}…` : message })
+    }
+  }
+  if (request.method === 'POST' && request.url === '/library/recover') {
+    try {
+      return sendJson(response, 200, recoverLegacyModels(JSON.parse(await readBody(request))))
+    } catch (error) {
+      return sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    }
   }
   if (request.method === 'POST' && request.url === '/refine-stl') {
     try {

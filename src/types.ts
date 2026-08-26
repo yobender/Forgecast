@@ -1,6 +1,8 @@
 export type AssetType = 'prop' | 'character' | 'creature'
-export type ArtStyle = 'polygon-game' | 'sculpted' | 'hand-painted' | 'low-poly' | 'dark-fantasy' | 'toon'
-export type MeshQuality = 'preview' | 'balanced' | 'high'
+// Kept as ArtStyle internally so older saved cast records remain readable.
+// These values now describe real mesh-processing behavior, not visual themes.
+export type ArtStyle = 'miniature-sculpt' | 'hard-surface' | 'organic' | 'low-poly' | 'print-safe'
+export type MeshQuality = 'preview' | 'balanced' | 'high' | 'ultra'
 export type GenerationStage = 'idle' | 'concept' | 'shape' | 'texture' | 'finalize' | 'complete'
 export type ReferenceView = 'front' | 'left' | 'back' | 'right' | 'top' | 'bottom'
 export type ReferenceFusionMode = 'front-priority' | 'full'
@@ -22,6 +24,7 @@ export interface CastSettings {
   performanceMode?: PerformanceMode
   printHeightMm?: number
   printRefineProfile?: PrintRefineProfile
+  targetTriangles?: number
 }
 
 export interface CastRecord extends CastSettings {
@@ -29,4 +32,21 @@ export interface CastRecord extends CastSettings {
   createdAt: string
   engine: string
   triangles: number
+  modelUrl?: string
+  thumbnail?: string
+  displayName?: string
+  favorite?: boolean
+  modelBytes?: number
+}
+
+export interface MeshInspection {
+  vertices: number
+  triangles: number
+  meshes: number
+  components: number
+  materials: number
+  watertight: boolean
+  extents: [number, number, number]
+  surfaceArea: number
+  fileBytes: number
 }

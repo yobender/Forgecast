@@ -9,14 +9,16 @@ Forgecast is a local React/TypeScript studio that treats image-to-3D models as r
 3. `scripts/engine-manager.mjs` stops the old worker, launches exactly one engine script, and writes logs under `.runtime/logs`.
 4. The selected adapter submits a multipart generation job and polls its status.
 5. The worker writes a GLB under `.runtime/forgecast-engine` and exposes it through a local-only output URL.
-6. `AssetViewer` loads the GLB into Three.js. The browser can then export the displayed scene as GLB or STL and save a reproducible `.forgecast.json` recipe.
+6. The engine manager copies completed output to `.runtime/library/models`, where worker restarts cannot remove it.
+7. `AssetViewer` loads the retained GLB into Three.js, captures a compact library thumbnail, and can export the displayed scene or save a reproducible `.forgecast.json` recipe.
+8. The library inspector runs `backend/mesh_inspect.py` on demand and caches actual topology statistics beside the retained model.
 
 ## Engine boundaries
 
 - **Hunyuan3D 2 Mini** uses the existing patched Modly service on port `8765`. It is the only engine that accepts exact-turntable multi-view shape inputs.
 - **Hunyuan3D 2.1** uses `backend/hunyuan21_server.py` on port `8081`. The Forgecast worker imports only the official shape package, keeping the runtime near the upstream 10 GB shape-stage VRAM requirement. It does not claim PBR texture output.
 - **TRELLIS.2** uses `backend/trellis2_server.py` on port `8766` inside WSL2. It exports the upstream O-Voxel result as a textured PBR GLB.
-- **Engine manager** uses port `8764` and binds only to `127.0.0.1`. It is lifecycle control, not an inference proxy.
+- **Engine manager** uses port `8764` and binds only to `127.0.0.1`. It owns worker lifecycle, persistent GLB storage, mesh inspection, and refined STL export; inference remains in the selected worker.
 
 The frontend talks to a common asynchronous contract:
 
@@ -27,7 +29,7 @@ The frontend talks to a common asynchronous contract:
 
 ## Storage and source policy
 
-Only Forgecast adapters, installers, and documentation are committed. Third-party repositories, Python environments, Hugging Face checkpoints, outputs, and logs live under `.runtime`, which is Git-ignored. Installers pin the reviewed upstream commits:
+Only Forgecast adapters, installers, reference assets, and documentation are committed. Third-party repositories, Python environments, Hugging Face checkpoints, retained/generated outputs, and logs live under `.runtime`, which is Git-ignored. Installers pin the reviewed upstream commits:
 
 - Microsoft TRELLIS.2: `75fbf0183001ed9876c8dbb35de6b68552ee08bd`
 - Tencent Hunyuan3D 2.1: `82920d643c0dc2f7bfd7255f45f62d386edfe60c`

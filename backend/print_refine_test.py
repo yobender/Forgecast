@@ -23,6 +23,24 @@ class PrintRefineTests(unittest.TestCase):
         self.assertGreater(stats["outputFaces"], 0)
         self.assertTrue(stats["watertight"])
 
+    def test_print_safe_forces_watertight_remesh_policy(self):
+        body = trimesh.creation.box(extents=(1.0, 2.0, 0.5))
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.glb"
+            body.export(source)
+            _, stats = refine_mesh(source, 50.0, "fine", "print-safe")
+        self.assertEqual(stats["geometryPreset"], "print-safe")
+        self.assertTrue(stats["forcedWatertightRemesh"])
+        self.assertTrue(stats["watertightRemesh"])
+
+    def test_rejects_unknown_geometry_preset(self):
+        body = trimesh.creation.box(extents=(1.0, 2.0, 0.5))
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.glb"
+            body.export(source)
+            with self.assertRaisesRegex(ValueError, "Unknown geometry preset"):
+                refine_mesh(source, 50.0, "fine", "not-a-preset")
+
 
 if __name__ == "__main__":
     unittest.main()

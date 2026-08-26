@@ -2,7 +2,7 @@ import { QUALITY_LABELS } from '../lib/presets'
 import type { CastSettings, MaterialMode, MeshQuality, RealEngineId, ReferenceImageSet } from '../types'
 import type { EngineProgress, EngineResult } from './contracts'
 import { detectRealEngine as detectHunyuanMini, generateRealMesh } from './modlyEngine'
-import { buildStyleConditioning } from './styleRecipes'
+import { buildStyleConditioning, GEOMETRY_PRESETS } from './styleRecipes'
 
 const MANAGER_BASE = 'http://127.0.0.1:8764'
 const HUNYUAN21_BASE = 'http://127.0.0.1:8081'
@@ -222,8 +222,8 @@ export function engineRequestProfile(
   if (engineId === 'hunyuan-2.1') {
     const paintProfile = quality === 'preview' ? 'fast' : quality === 'balanced' ? 'balanced' : 'full'
     return {
-      resolution: quality === 'preview' ? 256 : quality === 'balanced' ? 384 : 512,
-      inferenceSteps: quality === 'preview' ? 20 : quality === 'balanced' ? 35 : 50,
+      resolution: quality === 'preview' ? 256 : quality === 'balanced' ? 384 : quality === 'high' ? 448 : 512,
+      inferenceSteps: quality === 'preview' ? 20 : quality === 'balanced' ? 35 : quality === 'high' ? 50 : 65,
       targetTriangles,
       textureSize: materialMode === 'pbr' ? (quality === 'high' ? 2048 : 1024) : 0,
       paintProfile,
@@ -231,7 +231,7 @@ export function engineRequestProfile(
   }
   return {
     resolution: quality === 'preview' ? 512 : 1024,
-    inferenceSteps: quality === 'preview' ? 12 : quality === 'balanced' ? 20 : 30,
+    inferenceSteps: quality === 'preview' ? 12 : quality === 'balanced' ? 20 : quality === 'high' ? 30 : 40,
     targetTriangles,
     textureSize: quality === 'preview' ? 1024 : 2048,
   }
@@ -261,7 +261,14 @@ async function generateStandardEngine(
   const image = images.front
   if (!image) throw new Error(`${REAL_ENGINE_DEFINITIONS[engineId].name} requires a front reference image.`)
   const base = engineId === 'hunyuan-2.1' ? HUNYUAN21_BASE : TRELLIS2_BASE
-  const profile = engineRequestProfile(engineId, settings.quality, settings.materialMode)
+  const baseProfile = engineRequestProfile(engineId, settings.quality, settings.materialMode)
+  const geometryPreset = GEOMETRY_PRESETS[settings.style]
+  const profile = {
+    ...baseProfile,
+    targetTriangles: settings.materialMode === 'pbr' && settings.targetTriangles
+      ? settings.targetTriangles
+      : Math.max(4000, Math.round(baseProfile.targetTriangles * geometryPreset.targetTriangleRatio)),
+  }
   const form = new FormData()
   form.append('image', image)
   form.append('seed', String(settings.seed))

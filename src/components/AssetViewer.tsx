@@ -7,15 +7,15 @@ import type { ArtStyle, AssetType } from '../types'
 export interface AssetViewerHandle {
   getObject: () => THREE.Object3D | null
   preparePbrExport: (textureSize: number) => () => void
+  captureThumbnail: () => string | null
 }
 
 const PALETTES: Record<ArtStyle, [string, string, string]> = {
-  'polygon-game': ['#4f967d', '#e0ad57', '#263c38'],
-  sculpted: ['#9b6c46', '#d4975d', '#4d2f22'],
-  'hand-painted': ['#23828a', '#efaf42', '#132e3c'],
+  'miniature-sculpt': ['#a89c94', '#d0c5ba', '#57514d'],
+  'hard-surface': ['#718087', '#aab6ba', '#354148'],
+  organic: ['#987968', '#baa28f', '#51473f'],
   'low-poly': ['#6ab47b', '#f1c35b', '#263c31'],
-  'dark-fantasy': ['#3b4656', '#be4c37', '#171a20'],
-  toon: ['#6d70e8', '#f08f58', '#292a4a'],
+  'print-safe': ['#4f967d', '#a8c8bf', '#263c38'],
 }
 
 function Material({ color, roughness = 0.7 }: { color: string; roughness?: number }) {
@@ -415,7 +415,7 @@ const GeneratedAsset = forwardRef<THREE.Group, { type: AssetType; style: ArtStyl
   useEffect(() => {
     const current = group.current
     if (!current) return
-    const faceted = style === 'polygon-game' || style === 'low-poly'
+    const faceted = style === 'low-poly'
     current.traverse((object) => {
       if (object instanceof THREE.Mesh && object.material instanceof THREE.MeshStandardMaterial) {
         object.material.wireframe = false
@@ -423,8 +423,8 @@ const GeneratedAsset = forwardRef<THREE.Group, { type: AssetType; style: ArtStyl
         object.material.opacity = wireframe ? 0.16 : 1
         object.material.depthWrite = !wireframe
         object.material.flatShading = faceted
-        object.material.roughness = style === 'polygon-game' ? 0.88 : object.material.roughness
-        object.material.metalness = style === 'polygon-game' ? 0.02 : object.material.metalness
+        object.material.roughness = style === 'miniature-sculpt' ? 0.88 : object.material.roughness
+        object.material.metalness = style === 'miniature-sculpt' ? 0.02 : object.material.metalness
         object.material.needsUpdate = true
       }
     })
@@ -441,12 +441,15 @@ const GeneratedAsset = forwardRef<THREE.Group, { type: AssetType; style: ArtStyl
   )
 })
 
-const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean; detailTextureSize: number; proceduralPbr: boolean }>(({ url, style, wireframe, detailTextureSize, proceduralPbr }, ref) => {
+const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean; detailTextureSize: number; proceduralPbr: boolean; onReady?: () => void }>(({ url, style, wireframe, detailTextureSize, proceduralPbr, onReady }, ref) => {
   const { scene } = useGLTF(url)
   const clone = useMemo(() => {
     const result = scene.clone(true)
     result.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return
+      // AI meshes can have unreliable generated bounds. Disabling per-mesh
+      // culling prevents pieces from popping in and out while orbiting.
+      object.frustumCulled = false
       if (object.geometry.hasAttribute('color') && proceduralPbr && !hasNativePbrMaterial(object)) applyColorAwareMaterials(object, detailTextureSize)
       else if (object.geometry.hasAttribute('color') && !proceduralPbr) applyLightweightVertexMaterial(object)
       else {
@@ -458,7 +461,11 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
       }
     })
     return result
-  }, [detailTextureSize, proceduralPbr, scene])
+  // A stable URL identifies an immutable generated GLB. Some loader result
+  // wrappers change identity during app status polling; depending on `scene`
+  // caused the clone to be destroyed and fetched again every few seconds.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailTextureSize, proceduralPbr, url])
   const group = useRef<THREE.Group>(null)
   useImperativeHandle(ref, () => group.current as THREE.Group)
 
@@ -471,7 +478,9 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
     clone.position.set(-center.x, -bounds.min.y, -center.z)
     group.current.scale.setScalar(scale)
     group.current.position.set(0, -1.1, 0)
-  }, [clone])
+    const frame = window.requestAnimationFrame(() => onReady?.())
+    return () => window.cancelAnimationFrame(frame)
+  }, [clone, onReady])
 
   useEffect(() => {
     clone.traverse((object) => {
@@ -486,8 +495,8 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
           material.depthWrite = !wireframe
           // AI meshes contain many irregular source triangles. Showing every
           // one as a hard face makes curved handles look crumpled. Keep the
-          // explicit Low-poly preset faceted, while Polygon-game uses the
-          // exported vertex normals for cleaner curves and readable details.
+          // Only the explicit Low-poly preset is faceted. All print-oriented
+          // presets use exported vertex normals for readable curved surfaces.
           material.flatShading = style === 'low-poly'
           material.color.set('#ffffff')
           material.needsUpdate = true
@@ -501,24 +510,41 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
 
   useEffect(() => () => {
     disposeLoadedClone(clone)
-    useGLTF.clear(url)
-  }, [clone, url])
+  }, [clone])
 
   return <group ref={group}><primitive object={clone} /></group>
 })
 
-export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string; detailTextureSize?: number; proceduralPbr?: boolean }>(({ type, style, wireframe = false, autoRotate = false, modelUrl, detailTextureSize = 1024, proceduralPbr = true }, ref) => {
+export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string; detailTextureSize?: number; proceduralPbr?: boolean; onModelReady?: () => void }>(({ type, style, wireframe = false, autoRotate = false, modelUrl, detailTextureSize = 1024, proceduralPbr = true, onModelReady }, ref) => {
   const asset = useRef<THREE.Group>(null)
+  const renderer = useRef<THREE.WebGLRenderer>(null)
   useImperativeHandle(ref, () => ({
     getObject: () => asset.current,
     preparePbrExport: (textureSize: number) => preparePbrTextureExport(asset.current, textureSize),
+    captureThumbnail: () => {
+      const source = renderer.current?.domElement
+      if (!source || source.width === 0 || source.height === 0) return null
+      const thumbnail = document.createElement('canvas')
+      thumbnail.width = 240
+      thumbnail.height = 180
+      const context = thumbnail.getContext('2d')
+      if (!context) return null
+      context.fillStyle = '#111517'
+      context.fillRect(0, 0, thumbnail.width, thumbnail.height)
+      const sourceAspect = source.width / source.height
+      const targetAspect = thumbnail.width / thumbnail.height
+      const width = sourceAspect > targetAspect ? thumbnail.width : thumbnail.height * sourceAspect
+      const height = sourceAspect > targetAspect ? thumbnail.width / sourceAspect : thumbnail.height
+      context.drawImage(source, (thumbnail.width - width) / 2, (thumbnail.height - height) / 2, width, height)
+      return thumbnail.toDataURL('image/jpeg', 0.72)
+    },
   }))
   return (
     <Canvas
       shadows
       camera={{ position: [4.5, 3.2, 5.8], fov: 38 }}
-      gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping }}
-      onCreated={({ gl }) => { gl.toneMappingExposure = 0.82 }}
+      gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, preserveDrawingBuffer: true }}
+      onCreated={({ gl }) => { renderer.current = gl; gl.toneMappingExposure = 0.82 }}
     >
       <color attach="background" args={['#111517']} />
       <fog attach="fog" args={['#111517', 8, 15]} />
@@ -527,7 +553,7 @@ export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; styl
       <directionalLight position={[4, 7, 4]} intensity={1.8} color="#ffe6cf" castShadow shadow-mapSize={[1024, 1024]} />
       <directionalLight position={[-4, 2, -3]} intensity={0.7} color="#82c7c2" />
       <Suspense fallback={null}>
-        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} detailTextureSize={detailTextureSize} proceduralPbr={proceduralPbr} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
+        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} detailTextureSize={detailTextureSize} proceduralPbr={proceduralPbr} onReady={onModelReady} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
       </Suspense>
       <Grid position={[0, -1.12, 0]} args={[20, 20]} cellSize={0.5} cellThickness={0.6} cellColor="#2b3839" sectionSize={2} sectionThickness={0.8} sectionColor="#475757" fadeDistance={12} fadeStrength={1.5} infiniteGrid />
       <Environment preset="studio" environmentIntensity={0.48} />

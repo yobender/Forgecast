@@ -34,13 +34,13 @@ function Get-PinnedRepository([string]$url, [string]$destination, [string]$commi
 }
 
 function Apply-ForgecastPatch([string]$repository, [string]$patchFile, [string]$label) {
-  & git -C $repository apply --check $patchFile 2>$null
+  & git -C $repository apply --recount --check $patchFile 2>$null
   if ($LASTEXITCODE -eq 0) {
-    & git -C $repository apply $patchFile
+    & git -C $repository apply --recount $patchFile
     Assert-LastCommand "$label patch"
     return
   }
-  & git -C $repository apply --reverse --check $patchFile 2>$null
+  & git -C $repository apply --recount --reverse --check $patchFile 2>$null
   if ($LASTEXITCODE -ne 0) {
     throw "$label patch does not match the pinned source. Delete .runtime and run setup again."
   }

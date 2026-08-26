@@ -140,14 +140,25 @@ def _watertight_remesh(mesh: trimesh.Trimesh, cell_size_mm: float) -> trimesh.Tr
         return mesh
 
 
-def refine_mesh(input_path: Path, target_height_mm: float, profile: str) -> tuple[trimesh.Trimesh, dict[str, object]]:
+GEOMETRY_PRESETS = {"miniature-sculpt", "hard-surface", "organic", "low-poly", "print-safe"}
+
+
+def refine_mesh(
+    input_path: Path,
+    target_height_mm: float,
+    profile: str,
+    geometry_preset: str = "miniature-sculpt",
+) -> tuple[trimesh.Trimesh, dict[str, object]]:
+    if geometry_preset not in GEOMETRY_PRESETS:
+        raise ValueError(f"Unknown geometry preset: {geometry_preset}")
     loaded = trimesh.load(input_path, process=False)
     mesh = _scene_to_mesh(loaded)
     input_faces = len(mesh.faces)
     mesh.remove_infinite_values()
     mesh.remove_unreferenced_vertices()
     mesh.merge_vertices()
-    mesh, removed_components = _remove_floaters(mesh, profile)
+    floater_profile = "balanced" if geometry_preset == "print-safe" else profile
+    mesh, removed_components = _remove_floaters(mesh, floater_profile)
     mesh = _pymeshlab_repair(mesh, profile)
     mesh.remove_infinite_values()
     mesh.remove_unreferenced_vertices()
@@ -170,8 +181,12 @@ def refine_mesh(input_path: Path, target_height_mm: float, profile: str) -> tupl
     mesh.apply_translation([-center_xy[0], -center_xy[1], -bounds[0, 2]])
 
     watertight_remesh = False
-    cell_size_mm = max(0.1 if profile == "fine" else 0.16, target_height_mm / (500 if profile == "fine" else 350))
-    if not mesh.is_watertight:
+    if geometry_preset == "print-safe":
+        cell_size_mm = max(0.14, target_height_mm / 400)
+    else:
+        cell_size_mm = max(0.1 if profile == "fine" else 0.16, target_height_mm / (500 if profile == "fine" else 350))
+    force_watertight_remesh = geometry_preset == "print-safe"
+    if force_watertight_remesh or not mesh.is_watertight:
         mesh = _watertight_remesh(mesh, cell_size_mm)
         watertight_remesh = True
         bounds = mesh.bounds
@@ -187,6 +202,8 @@ def refine_mesh(input_path: Path, target_height_mm: float, profile: str) -> tupl
         "detailCellMm": round(cell_size_mm, 4) if watertight_remesh else None,
         "heightMm": round(float(mesh.extents[2]), 3),
         "profile": profile,
+        "geometryPreset": geometry_preset,
+        "forcedWatertightRemesh": force_watertight_remesh,
     }
     return mesh, stats
 
@@ -197,10 +214,11 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--height-mm", required=True, type=float)
     parser.add_argument("--profile", choices=("balanced", "fine"), default="fine")
+    parser.add_argument("--geometry-preset", choices=tuple(sorted(GEOMETRY_PRESETS)), default="miniature-sculpt")
     args = parser.parse_args()
     if not 10 <= args.height_mm <= 500:
         raise ValueError("Print height must be between 10 and 500 mm.")
-    mesh, stats = refine_mesh(args.input, args.height_mm, args.profile)
+    mesh, stats = refine_mesh(args.input, args.height_mm, args.profile, args.geometry_preset)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(args.output, file_type="stl")
     print(json.dumps(stats, separators=(",", ":")))

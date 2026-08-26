@@ -32,7 +32,7 @@ export const mockEngine: GenerationEngine = {
     }
     return {
       engine: this.name,
-      triangles: QUALITY_LABELS[settings.quality].triangles,
+      triangles: settings.materialMode === 'pbr' && settings.targetTriangles ? settings.targetTriangles : QUALITY_LABELS[settings.quality].triangles,
       conditioning: buildStyleConditioning(settings.prompt, settings.assetType, settings.style),
     }
   },

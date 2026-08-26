@@ -1,12 +1,26 @@
 import type { ArtStyle, GenerationStage, MeshQuality } from '../types'
 
 export const STYLE_LABELS: Record<ArtStyle, string> = {
-  'polygon-game': 'Polygon game',
-  sculpted: 'Sculpted',
-  'hand-painted': 'Hand-painted',
+  'miniature-sculpt': 'Miniature sculpt',
+  'hard-surface': 'Hard surface',
+  organic: 'Organic',
   'low-poly': 'Low poly',
-  'dark-fantasy': 'Dark fantasy',
-  toon: 'Toon',
+  'print-safe': 'Print-safe',
+}
+
+export const STYLE_DESCRIPTIONS: Record<ArtStyle, string> = {
+  'miniature-sculpt': 'Maximum relief and small sculpted forms',
+  'hard-surface': 'Sharper plates, bevels and mechanical edges',
+  organic: 'Smoother skin, cloth and creature transitions',
+  'low-poly': 'Actual mesh reduction with flat preview shading',
+  'print-safe': 'Stronger silhouettes and watertight STL remesh',
+}
+
+export const normalizeGeometryPreset = (value: unknown): ArtStyle => {
+  if (value === 'miniature-sculpt' || value === 'hard-surface' || value === 'organic' || value === 'low-poly' || value === 'print-safe') return value
+  if (value === 'polygon-game') return 'hard-surface'
+  if (value === 'hand-painted' || value === 'toon') return 'organic'
+  return 'miniature-sculpt'
 }
 
 export const QUALITY_LABELS: Record<MeshQuality, { label: string; triangles: number; texture: string }> = {
@@ -15,6 +29,7 @@ export const QUALITY_LABELS: Record<MeshQuality, { label: string; triangles: num
   preview: { label: 'Fast test', triangles: 20000, texture: '1K' },
   balanced: { label: 'Balanced', triangles: 50000, texture: '1K' },
   high: { label: 'Full quality', triangles: 100000, texture: '2K' },
+  ultra: { label: 'Ultra fine · slow', triangles: 150000, texture: '2K' },
 }
 
 export interface MiniQualityProfile {
@@ -28,11 +43,13 @@ const MINI_QUALITY_PROFILES: Record<'laptop' | 'desktop', Record<MeshQuality, Mi
     preview: { triangles: 20000, inferenceSteps: 10, octreeResolution: 256 },
     balanced: { triangles: 40000, inferenceSteps: 24, octreeResolution: 320 },
     high: { triangles: 75000, inferenceSteps: 35, octreeResolution: 384 },
+    ultra: { triangles: 100000, inferenceSteps: 60, octreeResolution: 448 },
   },
   desktop: {
     preview: { triangles: 20000, inferenceSteps: 10, octreeResolution: 256 },
     balanced: { triangles: 50000, inferenceSteps: 30, octreeResolution: 380 },
     high: { triangles: 100000, inferenceSteps: 50, octreeResolution: 512 },
+    ultra: { triangles: 150000, inferenceSteps: 70, octreeResolution: 512 },
   },
 }
 
@@ -43,6 +60,7 @@ export const HUNYUAN_PBR_HINTS: Record<MeshQuality, string> = {
   preview: '3 guided views · 1K PBR · fastest way to check shape and color placement.',
   balanced: '4 guided views · 1K PBR · recommended balance for everyday assets.',
   high: '6 guided views · 2K PBR · slowest mode; reserve it for a final approved shape.',
+  ultra: 'Maximum shape steps · 2K PBR · very slow; intended for the final approved reference.',
 }
 
 export const STAGES: Array<{ key: Exclude<GenerationStage, 'idle'>; label: string }> = [

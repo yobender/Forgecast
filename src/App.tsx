@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Box, Check, ChevronDown, Clock3, Cpu, Download, ImagePlus, Layers3, Play, RefreshCw, Rotate3D, Settings2, Sparkles, WandSparkles } from 'lucide-react'
+import { Box, Check, ChevronDown, Clock3, Cpu, Download, HardDrive, Heart, ImagePlus, Layers3, Play, RefreshCw, Rotate3D, Search, Settings2, Sparkles, Trash2, WandSparkles } from 'lucide-react'
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
 import { STLExporter } from 'three/addons/exporters/STLExporter.js'
 import { AssetViewer, type AssetViewerHandle } from './components/AssetViewer'
@@ -7,11 +7,11 @@ import { BrandMark } from './components/BrandMark'
 import { StageRail } from './components/StageRail'
 import { mockEngine } from './engine/mockEngine'
 import { activateRealEngine, detectRealEngines, generateWithRealEngine, releaseRealEngineGpu, REAL_ENGINE_DEFINITIONS, type UnifiedEngineStatuses } from './engine/realEngines'
-import { buildStyleConditioning } from './engine/styleRecipes'
+import { buildStyleConditioning, GEOMETRY_PRESETS } from './engine/styleRecipes'
 import { loadHistory, saveHistory } from './lib/history'
 import { slugify } from './lib/naming'
-import { HUNYUAN_PBR_HINTS, miniQualityProfile, QUALITY_LABELS, STYLE_LABELS } from './lib/presets'
-import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshQuality, PerformanceMode, PrintRefineProfile, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
+import { HUNYUAN_PBR_HINTS, miniQualityProfile, normalizeGeometryPreset, QUALITY_LABELS, STYLE_DESCRIPTIONS, STYLE_LABELS } from './lib/presets'
+import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshInspection, MeshQuality, PerformanceMode, PrintRefineProfile, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
 
 const DEFAULT_PROMPT = ''
 const REFERENCE_VIEWS: ReferenceView[] = ['front', 'back', 'left', 'right', 'top', 'bottom']
@@ -20,6 +20,7 @@ const SHAPE_VIEWS = new Set<ReferenceView>(['front', 'left', 'back', 'right'])
 const DEV_MODEL_URL = window.location.port === '5173' ? new URLSearchParams(window.location.search).get('model') ?? '' : ''
 const DEFAULT_ENGINE: RealEngineId = 'hunyuan-mini'
 const PRINT_SERVICE_BASE = 'http://127.0.0.1:8764'
+const GAME_TRIANGLE_BUDGETS = [10000, 25000, 50000, 100000] as const
 const savedEngine = (): RealEngineId => {
   const value = localStorage.getItem('forgecast-engine')
   return value && Object.hasOwn(REAL_ENGINE_DEFINITIONS, value) ? value as RealEngineId : DEFAULT_ENGINE
@@ -62,15 +63,36 @@ const downloadBlob = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url)
 }
 
+const retainModel = async (sourceUrl: string) => {
+  const response = await fetch(`${PRINT_SERVICE_BASE}/library/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceUrl }),
+  })
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({ error: response.statusText })) as { error?: string }
+    throw new Error(result.error || 'Could not retain the generated model')
+  }
+  const result = await response.json() as { url: string; bytes?: number }
+  return { url: `${PRINT_SERVICE_BASE}${result.url}`, bytes: result.bytes }
+}
+
+const formatBytes = (bytes?: number) => {
+  if (!bytes) return '—'
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  return `${Math.round(bytes / 1024)} KB`
+}
+
 export default function App() {
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [assetType, setAssetType] = useState<AssetType>('prop')
-  const [style, setStyle] = useState<ArtStyle>('polygon-game')
+  const [style, setStyle] = useState<ArtStyle>('miniature-sculpt')
   const [quality, setQuality] = useState<MeshQuality>('balanced')
   const [seed, setSeed] = useState(483921)
   const [materialMode, setMaterialMode] = useState<MaterialMode>('pbr')
   const [printHeightMm, setPrintHeightMm] = useState(75)
   const [printRefineProfile, setPrintRefineProfile] = useState<PrintRefineProfile>('fine')
+  const [targetTriangles, setTargetTriangles] = useState(25000)
   const [selectedEngine, setSelectedEngine] = useState<RealEngineId>(savedEngine)
   const [performanceSetting, setPerformanceSetting] = useState<PerformanceSetting>(savedPerformance)
   const [stage, setStage] = useState<GenerationStage>(DEV_MODEL_URL ? 'complete' : 'idle')
@@ -89,11 +111,19 @@ export default function App() {
   const [engineStatuses, setEngineStatuses] = useState<UnifiedEngineStatuses>(initialEngineStatuses)
   const [releasingGpu, setReleasingGpu] = useState(false)
   const [refiningStl, setRefiningStl] = useState(false)
+  const [libraryQuery, setLibraryQuery] = useState('')
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const [selectedLibraryId, setSelectedLibraryId] = useState<string | null>(null)
+  const [meshInspection, setMeshInspection] = useState<MeshInspection | null>(null)
+  const [inspectionLoading, setInspectionLoading] = useState(false)
   const viewerRef = useRef<AssetViewerHandle>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const batchFileInputRef = useRef<HTMLInputElement>(null)
   const pendingReferenceView = useRef<ReferenceView>('front')
   const imageDragDepth = useRef(0)
+  const previousEngine = useRef<RealEngineId>(selectedEngine)
+  const pendingThumbnailId = useRef<string | undefined>(undefined)
+  const legacyRecoveryStarted = useRef(false)
   const running = stage !== 'idle' && stage !== 'complete'
   const referenceCount = Object.keys(referenceFiles).length
   const shapeReferenceCount = REFERENCE_VIEWS.filter((view) => SHAPE_VIEWS.has(view) && referenceFiles[view]).length
@@ -103,13 +133,21 @@ export default function App() {
   const resolvedPerformance: PerformanceMode = performanceSetting === 'auto' ? hardware?.profile ?? 'laptop' : performanceSetting
   const laptopMode = resolvedPerformance === 'laptop'
   const miniProfile = miniQualityProfile(quality, laptopMode)
-  const displayTriangles = selectedEngine === 'hunyuan-mini' ? miniProfile.triangles : QUALITY_LABELS[quality].triangles
+  const geometryPreset = GEOMETRY_PRESETS[style]
+  const displayTriangles = materialMode === 'pbr' ? targetTriangles : Math.max(4000, Math.round((selectedEngine === 'hunyuan-mini' ? miniProfile.triangles : QUALITY_LABELS[quality].triangles) * geometryPreset.targetTriangleRatio))
   const liveTextureSize = laptopMode ? 1024 : 2048
   const desktopEngineBlocked = laptopMode && selectedEngine !== 'hunyuan-mini'
   const engineStarting = realEngine.installed && !realEngine.ready
   const multiViewInstalling = selectedEngine === 'hunyuan-mini' && realEngine.ready && referenceCount > 1 && referenceFusion === 'full' && !realEngine.multiViewDownloaded
   const hunyuanPaintBlocked = selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' && realEngine.ready && realEngine.paintAvailable === false
   const hasPbrOutput = Boolean(modelUrl) && materialMode === 'pbr'
+  const selectedLibraryRecord = history.find((record) => record.id === selectedLibraryId)
+  const filteredHistory = history.filter((record) => {
+    if (favoritesOnly && !record.favorite) return false
+    const query = libraryQuery.trim().toLowerCase()
+    if (!query) return true
+    return `${record.displayName ?? ''} ${record.prompt} ${record.engine} ${STYLE_LABELS[record.style]}`.toLowerCase().includes(query)
+  })
 
   const selectReferenceFile = useCallback((view: ReferenceView, file: File | null) => {
     if (!file) return
@@ -150,6 +188,34 @@ export default function App() {
   }
 
   useEffect(() => saveHistory(history), [history])
+
+  useEffect(() => {
+    if (legacyRecoveryStarted.current) return
+    legacyRecoveryStarted.current = true
+    const legacyCasts = history.filter((record) => !record.modelUrl && record.engineId).map(({ id, createdAt }) => ({ id, createdAt }))
+    if (legacyCasts.length === 0) return
+    void fetch(`${PRINT_SERVICE_BASE}/library/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ casts: legacyCasts }),
+    }).then(async (response) => {
+      if (!response.ok) return
+      const result = await response.json() as { recovered?: Array<{ castId: string; url: string }> }
+      const recovered = new Map((result.recovered ?? []).map((entry) => [entry.castId, `${PRINT_SERVICE_BASE}${entry.url}`]))
+      if (recovered.size > 0) setHistory((records) => records.map((record) => recovered.has(record.id) ? { ...record, modelUrl: recovered.get(record.id) } : record))
+    }).catch(() => undefined)
+  }, [history])
+
+  const capturePendingThumbnail = useCallback(() => {
+    const recordId = pendingThumbnailId.current
+    if (!recordId) return
+    window.setTimeout(() => {
+      const thumbnail = viewerRef.current?.captureThumbnail()
+      if (!thumbnail) return
+      pendingThumbnailId.current = undefined
+      setHistory((records) => records.map((record) => record.id === recordId ? { ...record, thumbnail } : record))
+    }, 300)
+  }, [])
 
   useEffect(() => {
     const urls: Partial<Record<ReferenceView, string>> = {}
@@ -204,7 +270,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('forgecast-engine', selectedEngine)
     setGenerationError('')
-    setModelUrl('')
+    if (previousEngine.current !== selectedEngine) {
+      previousEngine.current = selectedEngine
+      setModelUrl('')
+    }
     if (selectedEngine === 'trellis-2') setMaterialMode('pbr')
   }, [selectedEngine])
 
@@ -272,7 +341,7 @@ export default function App() {
       return
     }
     const runRealEngine = realEngine.ready && referenceCount > 0
-    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine, performanceMode: resolvedPerformance, printHeightMm, printRefineProfile }
+    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine, performanceMode: resolvedPerformance, printHeightMm, printRefineProfile, targetTriangles }
     const previousModelUrl = modelUrl
     setProgress(1)
     setStage('concept')
@@ -292,16 +361,33 @@ export default function App() {
       const result = runRealEngine
         ? await generateWithRealEngine(selectedEngine, referenceFiles, settings, onProgress)
         : await mockEngine.generate(settings, onProgress)
+      const recordId = crypto.randomUUID()
+      let retainedModelUrl = result.modelUrl ?? ''
+      let retainedModelBytes: number | undefined
+      if (result.modelUrl) {
+        try {
+          setEngineMessage('Saving model to the local library…')
+          const retained = await retainModel(result.modelUrl)
+          retainedModelUrl = retained.url
+          retainedModelBytes = retained.bytes
+        } catch (archiveError) {
+          console.warn('Model library archive failed; keeping the engine URL', archiveError)
+        }
+      }
       const record: CastRecord = {
-        id: crypto.randomUUID(),
+        id: recordId,
         ...settings,
         engineId: runRealEngine ? selectedEngine : undefined,
         engine: result.engine,
         triangles: result.triangles,
+        modelUrl: retainedModelUrl || undefined,
+        modelBytes: retainedModelBytes,
         createdAt: new Date().toISOString(),
       }
       setHistory((items) => [record, ...items])
-      setModelUrl(result.modelUrl ?? '')
+      setSelectedLibraryId(recordId)
+      pendingThumbnailId.current = retainedModelUrl ? recordId : undefined
+      setModelUrl(retainedModelUrl)
       setStage('complete')
     } catch (error) {
       console.error('Cast failed', error)
@@ -315,16 +401,18 @@ export default function App() {
   const restoreCast = (record: CastRecord) => {
     setPrompt(record.prompt)
     setAssetType(record.assetType)
-    setStyle(record.style)
+    setStyle(normalizeGeometryPreset(record.style))
     setQuality(record.quality)
     setSeed(record.seed)
     setMaterialMode(record.materialMode ?? 'pbr')
     setPrintHeightMm(record.printHeightMm ?? 75)
     setPrintRefineProfile(record.printRefineProfile ?? 'fine')
+    setTargetTriangles(record.targetTriangles ?? (record.materialMode === 'shape-only' ? 25000 : record.triangles || 25000))
     if (record.performanceMode) setPerformanceSetting(record.performanceMode)
     setReferenceFusion(record.referenceFusion ?? 'front-priority')
     if (record.engineId) setSelectedEngine(record.engineId)
-    setModelUrl('')
+    pendingThumbnailId.current = record.modelUrl && !record.thumbnail ? record.id : undefined
+    setModelUrl(record.modelUrl ?? '')
     setProgress(100)
     setStage('complete')
   }
@@ -341,6 +429,7 @@ export default function App() {
       performanceMode: resolvedPerformance,
       printHeightMm,
       printRefineProfile,
+      targetTriangles,
       referenceFusion,
       engine: modelUrl ? selectedEngine : 'mock',
       referenceViews: Object.keys(referenceFiles),
@@ -357,6 +446,50 @@ export default function App() {
     downloadBlob(new Blob([data], { type: 'model/stl' }), `${slugify(prompt)}.stl`)
   }
 
+  useEffect(() => {
+    setMeshInspection(null)
+    const url = selectedLibraryRecord?.modelUrl
+    if (!url?.startsWith(`${PRINT_SERVICE_BASE}/library/models/`)) return
+    let cancelled = false
+    setInspectionLoading(true)
+    void fetch(`${url}/stats`).then(async (response) => {
+      if (!response.ok) throw new Error('Mesh inspection failed')
+      const stats = await response.json() as MeshInspection
+      if (!cancelled) setMeshInspection(stats)
+    }).catch(() => undefined).finally(() => { if (!cancelled) setInspectionLoading(false) })
+    return () => { cancelled = true }
+  }, [selectedLibraryRecord?.id, selectedLibraryRecord?.modelUrl])
+
+  const openLibraryRecord = (record: CastRecord) => {
+    setSelectedLibraryId(record.id)
+    restoreCast(record)
+  }
+
+  const updateSelectedRecord = (changes: Partial<CastRecord>) => {
+    if (!selectedLibraryId) return
+    setHistory((records) => records.map((record) => record.id === selectedLibraryId ? { ...record, ...changes } : record))
+  }
+
+  const downloadLibraryModel = async (record: CastRecord) => {
+    if (!record.modelUrl) return
+    const response = await fetch(record.modelUrl)
+    if (!response.ok) return
+    downloadBlob(await response.blob(), `${slugify(record.displayName || record.prompt || 'forgecast-asset')}.glb`)
+  }
+
+  const deleteLibraryRecord = async (record: CastRecord) => {
+    if (!window.confirm(`Delete “${record.displayName || record.prompt || 'Untitled asset'}” from the Forgecast library? This removes its retained GLB from disk.`)) return
+    if (record.modelUrl?.startsWith(`${PRINT_SERVICE_BASE}/library/models/`)) {
+      await fetch(record.modelUrl, { method: 'DELETE' }).catch(() => undefined)
+    }
+    setHistory((records) => records.filter((item) => item.id !== record.id))
+    if (selectedLibraryId === record.id) {
+      setSelectedLibraryId(null)
+      setMeshInspection(null)
+      if (modelUrl === record.modelUrl) setModelUrl('')
+    }
+  }
+
   const exportStl = async () => {
     if (!modelUrl) {
       exportQuickStl()
@@ -371,7 +504,7 @@ export default function App() {
       const refinedResponse = await fetch(`${PRINT_SERVICE_BASE}/refine-stl`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceUrl: modelUrl, heightMm: printHeightMm, profile: printRefineProfile }),
+        body: JSON.stringify({ sourceUrl: modelUrl, heightMm: printHeightMm, profile: printRefineProfile, geometryPreset: style }),
       })
       if (!refinedResponse.ok) {
         const message = await refinedResponse.json().catch(() => ({ error: refinedResponse.statusText })) as { error?: string }
@@ -429,17 +562,13 @@ export default function App() {
             <button className="icon-button small" title="Randomize seed" onClick={() => setSeed(Math.floor(Math.random() * 999999))}><RefreshCw size={15} /></button>
           </div>
 
-          <div className="field-group engine-picker">
-            <label htmlFor="engine">Generation engine</label>
-            <div className="select-wrap"><select id="engine" value={selectedEngine} onChange={(event) => setSelectedEngine(event.target.value as RealEngineId)}>{(Object.keys(REAL_ENGINE_DEFINITIONS) as RealEngineId[]).map((id) => <option value={id} key={id}>{REAL_ENGINE_DEFINITIONS[id].name}{laptopMode && id !== 'hunyuan-mini' ? ' · desktop only' : engineStatuses[id].installed ? '' : ' · not installed'}</option>)}</select><ChevronDown size={14} /></div>
-            <small><strong>{engineDefinition.output}</strong> · {engineDefinition.description}</small>
-          </div>
-
-          <div className="field-group engine-picker">
-            <label htmlFor="performance">Performance profile</label>
-            <div className="select-wrap"><select id="performance" value={performanceSetting} onChange={(event) => setPerformanceSetting(event.target.value as PerformanceSetting)}><option value="auto">Auto · {hardware?.profile === 'desktop' ? 'desktop full' : 'laptop safe'}</option><option value="laptop">Laptop safe</option><option value="desktop">Desktop full</option></select><ChevronDown size={14} /></div>
-            <small>{hardware?.gpuName ? `${hardware.gpuName}${hardware.vramMb ? ` · ${(hardware.vramMb / 1024).toFixed(1)} GB VRAM` : ''}` : 'Safe laptop limits are used until GPU detection is available.'}</small>
-          </div>
+          {selectedEngine !== 'trellis-2' && <div className="field-group output-target">
+            <label>Output target</label>
+            <div className="output-choice" role="group" aria-label="Output target">
+              <button className={materialMode === 'pbr' ? 'active' : ''} type="button" disabled={selectedEngine === 'hunyuan-2.1' && realEngine.paintAvailable === false} onClick={() => setMaterialMode('pbr')}><Box size={16} /><span><strong>Game asset</strong><small>Color GLB · optimized mesh</small></span></button>
+              <button className={materialMode === 'shape-only' ? 'active' : ''} type="button" onClick={() => setMaterialMode('shape-only')}><Layers3 size={16} /><span><strong>Print model</strong><small>Raw shape · refined STL</small></span></button>
+            </div>
+          </div>}
 
           <div className="field-group">
             <label htmlFor="prompt">Asset name / notes</label>
@@ -478,42 +607,58 @@ export default function App() {
           </div>
 
           <div className="field-group">
-            <label>Art direction</label>
+            <label>Geometry preset</label>
             <div className="style-grid">
               {(Object.keys(STYLE_LABELS) as ArtStyle[]).map((key, index) => (
                 <button className={`style-card style-card--${index + 1} ${style === key ? 'active' : ''}`} key={key} onClick={() => setStyle(key)}>
-                  <span className="style-card__swatch" /><span>{STYLE_LABELS[key]}</span>{style === key && <Check size={13} />}
+                  <span className="style-card__swatch" /><span className="style-card__copy"><strong>{STYLE_LABELS[key]}</strong><small>{STYLE_DESCRIPTIONS[key]}</small></span>{style === key && <Check size={13} />}
                 </button>
               ))}
             </div>
-            {style === 'polygon-game' && <div className="baked-style-note"><Sparkles size={12} /> Baked preset · faceted · chunky · game-ready silhouette</div>}
+            <div className="baked-style-note"><Sparkles size={12} /> {STYLE_DESCRIPTIONS[style]} · affects shape guides, mesh budget and STL processing</div>
           </div>
 
-          <div className="field-group settings-row">
-            <div><label>{selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' ? 'Cast quality' : 'Mesh quality'}</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => {
+          <div className="field-group">
+            <label>Reconstruction detail</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => {
               const mini = miniQualityProfile(key, laptopMode)
-              const detail = selectedEngine === 'hunyuan-mini' && materialMode === 'shape-only' ? `raw · ${mini.octreeResolution} grid` : `${(selectedEngine === 'hunyuan-mini' ? mini.triangles : QUALITY_LABELS[key].triangles) / 1000}K`
-              return <option value={key} key={key}>{QUALITY_LABELS[key].label} · {detail}</option>
-            })}</select><ChevronDown size={14} /></div></div>
-            <div><label>Seed</label><input className="seed-input" value={seed} onChange={(event) => setSeed(Number(event.target.value))} type="number" /></div>
+              return <option value={key} key={key}>{QUALITY_LABELS[key].label} · {mini.octreeResolution} grid · {mini.inferenceSteps} steps</option>
+            })}</select><ChevronDown size={14} /></div>
+            <small className="field-help">Controls how carefully the AI reconstructs the shape. It does not set the final game mesh size.</small>
           </div>
 
           {selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' && <div className="baked-style-note"><Sparkles size={12} /> {HUNYUAN_PBR_HINTS[quality]}</div>}
 
-          {selectedEngine !== 'trellis-2' && <div className="field-group">
-            <label>Material output</label>
-            <div className="segmented">
-              <button className={materialMode === 'pbr' ? 'active' : ''} type="button" disabled={selectedEngine === 'hunyuan-2.1' && realEngine.paintAvailable === false} onClick={() => setMaterialMode('pbr')}>{selectedEngine === 'hunyuan-mini' ? 'Color asset' : 'PBR color'}</button>
-              <button className={materialMode === 'shape-only' ? 'active' : ''} type="button" onClick={() => setMaterialMode('shape-only')}>{selectedEngine === 'hunyuan-mini' ? 'Print STL' : 'Shape only'}</button>
+          {materialMode === 'pbr' && <div className="field-group budget-panel">
+            <div className="budget-panel__heading"><div><label>Game mesh budget</label><small>Final target</small></div><strong>{targetTriangles.toLocaleString()} <span>tris</span></strong></div>
+            <div className="budget-options" role="group" aria-label="Game mesh triangle budget">
+              {GAME_TRIANGLE_BUDGETS.map((budget) => <button type="button" className={targetTriangles === budget ? 'active' : ''} key={budget} onClick={() => setTargetTriangles(budget)}><strong>{budget / 1000}K</strong><span>{budget === 10000 ? 'Light' : budget === 25000 ? 'Game' : budget === 50000 ? 'Hero' : 'High'}</span></button>)}
             </div>
-            <small>{materialMode === 'pbr' ? (selectedEngine === 'hunyuan-mini' ? `${liveTextureSize / 1024}K live detail materials; GLB export is prepared at 2K.` : 'Generates shape, frees VRAM, then paints UV-aligned albedo and metallic/roughness maps.') : 'Keeps the raw reconstruction instead of decimating it, then repairs and scales the mesh during STL export.'}</small>
+            <div className="budget-panel__note"><Layers3 size={12} /> Reconstruction can stay high while the exported GLB is reduced to this budget.</div>
           </div>}
 
           {materialMode === 'shape-only' && <div className="field-group settings-row print-settings-row">
-            <div><label>Print height</label><div className="print-size-input"><input className="seed-input" value={printHeightMm} min={10} max={500} step={1} onChange={(event) => setPrintHeightMm(Math.max(10, Math.min(500, Number(event.target.value) || 10)))} type="number" /><span>mm</span></div></div>
-            <div><label>STL refinement</label><div className="select-wrap"><select value={printRefineProfile} onChange={(event) => setPrintRefineProfile(event.target.value as PrintRefineProfile)}><option value="fine">Fine detail</option><option value="balanced">Balanced cleanup</option></select><ChevronDown size={14} /></div></div>
+            <div><label>Export height</label><div className="print-size-input"><input className="seed-input" value={printHeightMm} min={10} max={500} step={1} onWheel={(event) => event.currentTarget.blur()} onChange={(event) => setPrintHeightMm(Math.max(10, Math.min(500, Number(event.target.value) || 10)))} type="number" /><span>mm</span></div></div>
+            <div><label>STL export refinement</label><div className="select-wrap"><select value={printRefineProfile} onChange={(event) => setPrintRefineProfile(event.target.value as PrintRefineProfile)}><option value="fine">Fine detail</option><option value="balanced">Balanced cleanup</option></select><ChevronDown size={14} /></div></div>
           </div>}
-          {materialMode === 'shape-only' && <div className="baked-style-note"><Sparkles size={12} /> Fine detail preserves smaller disconnected features; both modes repair holes, normals and floating fragments before export.</div>}
+          {materialMode === 'shape-only' && <div className="baked-style-note"><Sparkles size={12} /> Export only · Fine detail preserves existing features while repairing the downloaded STL; it cannot invent detail missing from the raw preview.</div>}
+          {quality === 'ultra' && <div className="baked-style-note"><Clock3 size={12} /> Ultra uses a {miniProfile.octreeResolution} reconstruction grid and {miniProfile.inferenceSteps} shape steps. Expect a substantially longer cast.</div>}
+
+          <details className="advanced-panel">
+            <summary><span><Settings2 size={14} /> Engine & advanced settings</span><ChevronDown size={14} /></summary>
+            <div className="advanced-panel__body">
+              <div className="field-group engine-picker">
+                <label htmlFor="engine">Generation engine</label>
+                <div className="select-wrap"><select id="engine" value={selectedEngine} onChange={(event) => setSelectedEngine(event.target.value as RealEngineId)}>{(Object.keys(REAL_ENGINE_DEFINITIONS) as RealEngineId[]).map((id) => <option value={id} key={id}>{REAL_ENGINE_DEFINITIONS[id].name}{laptopMode && id !== 'hunyuan-mini' ? ' · desktop only' : engineStatuses[id].installed ? '' : ' · not installed'}</option>)}</select><ChevronDown size={14} /></div>
+                <small><strong>{engineDefinition.output}</strong> · {engineDefinition.description}</small>
+              </div>
+              <div className="field-group engine-picker">
+                <label htmlFor="performance">Performance profile</label>
+                <div className="select-wrap"><select id="performance" value={performanceSetting} onChange={(event) => setPerformanceSetting(event.target.value as PerformanceSetting)}><option value="auto">Auto · {hardware?.profile === 'desktop' ? 'desktop full' : 'laptop safe'}</option><option value="laptop">Laptop safe</option><option value="desktop">Desktop full</option></select><ChevronDown size={14} /></div>
+                <small>{hardware?.gpuName ? `${hardware.gpuName}${hardware.vramMb ? ` · ${(hardware.vramMb / 1024).toFixed(1)} GB VRAM` : ''}` : 'Safe laptop limits are used until GPU detection is available.'}</small>
+              </div>
+              <div className="field-group"><label>Seed</label><input className="seed-input" value={seed} onChange={(event) => setSeed(Number(event.target.value))} type="number" /></div>
+            </div>
+          </details>
 
           {desktopEngineBlocked && <div className="baked-style-note"><Cpu size={12} /> Desktop-only engine blocked by Laptop safe mode. Use Hunyuan Mini here, or explicitly choose Desktop full to override.</div>}
 
@@ -527,10 +672,10 @@ export default function App() {
 
         <section className="viewer-panel">
           <div className="viewer-toolbar">
-            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {materialMode === 'shape-only' ? 'Raw detail mesh' : `${displayTriangles.toLocaleString()} tris`}</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? `${liveTextureSize / 1024}K live PBR` : `${printHeightMm} mm print`}</span>}</div>
+            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {materialMode === 'shape-only' ? 'Raw print mesh' : `${displayTriangles.toLocaleString()} tri target`}</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? `${liveTextureSize / 1024}K live PBR` : `${printHeightMm} mm print`}</span>}</div>
             <div><button className="tool-button" disabled={running || refiningStl || releasingGpu || !realEngine.online} onClick={releaseGpu}><Cpu size={15} /> {releasingGpu ? 'Releasing…' : 'Free GPU'}</button><button className={`tool-button ${autoRotate ? 'active' : ''}`} onClick={() => setAutoRotate((value) => !value)}><Rotate3D size={15} /> {autoRotate ? 'Rotating' : 'Orbit'}</button><button className={`tool-button ${wireframe ? 'active' : ''}`} onClick={() => setWireframe((value) => !value)}>Wireframe</button></div>
           </div>
-          <div className="viewer-canvas">{!modelUrl && <div className="demo-watermark"><strong>DEMO GEOMETRY</strong><span>Not generated from your prompt</span></div>}<AssetViewer ref={viewerRef} type={assetType} style={style} wireframe={wireframe} autoRotate={autoRotate} modelUrl={modelUrl || undefined} detailTextureSize={liveTextureSize} proceduralPbr={materialMode === 'pbr'} /></div>
+          <div className="viewer-canvas">{!modelUrl && <div className="demo-watermark"><strong>DEMO GEOMETRY</strong><span>Not generated from your prompt</span></div>}<AssetViewer ref={viewerRef} type={assetType} style={style} wireframe={wireframe} autoRotate={autoRotate} modelUrl={modelUrl || undefined} detailTextureSize={liveTextureSize} proceduralPbr={materialMode === 'pbr'} onModelReady={capturePendingThumbnail} /></div>
           <div className="viewer-caption"><span>Drag to orbit · Scroll to zoom · Right-drag to pan</span><span>{modelUrl ? 'Real local AI output' : 'Procedural demo geometry'}</span></div>
 
           <div className="generation-dock">
@@ -547,13 +692,39 @@ export default function App() {
         </section>
 
         <aside className="history-panel">
-          <div className="history-heading"><div><span className="eyebrow">LIBRARY</span><h2>Recent casts</h2></div><span>{history.length}</span></div>
+          <div className="history-heading"><div><span className="eyebrow">ASSET LIBRARY</span><h2>Saved casts</h2></div><span>{history.length}</span></div>
+          <div className="library-toolbar">
+            <label><Search size={13} /><input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="Search assets" /></label>
+            <button className={favoritesOnly ? 'active' : ''} type="button" title="Show favorites only" onClick={() => setFavoritesOnly((value) => !value)}><Heart size={14} fill={favoritesOnly ? 'currentColor' : 'none'} /></button>
+          </div>
+          {selectedLibraryRecord && <section className="library-inspector">
+            <div className="library-inspector__hero">{selectedLibraryRecord.thumbnail ? <img src={selectedLibraryRecord.thumbnail} alt="Selected asset preview" /> : <Box size={34} />}</div>
+            <input className="library-name" aria-label="Asset name" value={selectedLibraryRecord.displayName ?? selectedLibraryRecord.prompt ?? ''} placeholder="Untitled asset" onChange={(event) => updateSelectedRecord({ displayName: event.target.value })} />
+            <div className="library-inspector__source"><span>{selectedLibraryRecord.engine}</span><span>{QUALITY_LABELS[selectedLibraryRecord.quality].label}</span></div>
+            {inspectionLoading && <div className="inspection-loading"><RefreshCw className="spin" size={12} /> Inspecting retained mesh…</div>}
+            {meshInspection && <dl className="mesh-stats">
+              <div><dt>Triangles</dt><dd>{meshInspection.triangles.toLocaleString()}</dd></div>
+              <div><dt>Vertices</dt><dd>{meshInspection.vertices.toLocaleString()}</dd></div>
+              <div><dt>Parts</dt><dd>{meshInspection.components}</dd></div>
+              <div><dt>Materials</dt><dd>{meshInspection.materials}</dd></div>
+              <div><dt>File size</dt><dd>{formatBytes(meshInspection.fileBytes)}</dd></div>
+              <div><dt>Manifold</dt><dd className={meshInspection.watertight ? 'stat-good' : 'stat-warn'}>{meshInspection.watertight ? 'Watertight' : 'Open mesh'}</dd></div>
+            </dl>}
+            {!inspectionLoading && !meshInspection && <div className="inspection-loading"><HardDrive size={12} /> {selectedLibraryRecord.modelUrl ? `${formatBytes(selectedLibraryRecord.modelBytes)} retained model` : 'Settings only · model unavailable'}</div>}
+            <div className="library-actions">
+              <button className={selectedLibraryRecord.favorite ? 'active' : ''} type="button" onClick={() => updateSelectedRecord({ favorite: !selectedLibraryRecord.favorite })}><Heart size={13} fill={selectedLibraryRecord.favorite ? 'currentColor' : 'none'} /> Favorite</button>
+              <button type="button" disabled={!selectedLibraryRecord.modelUrl} onClick={() => { void downloadLibraryModel(selectedLibraryRecord) }}><Download size={13} /> GLB</button>
+              <button className="danger" type="button" onClick={() => { void deleteLibraryRecord(selectedLibraryRecord) }}><Trash2 size={13} /> Delete</button>
+            </div>
+          </section>}
           <div className="history-list">
             {history.length === 0 && <div className="empty-history"><Clock3 size={28} /><strong>No casts yet</strong><span>Your generated assets and recipes will appear here.</span></div>}
-            {history.map((record, index) => (
-              <button className="history-card" key={record.id} onClick={() => restoreCast(record)}>
-                <span className={`history-thumb history-thumb--${record.assetType}`}><Box size={22} /></span>
-                <span className="history-copy"><strong>{record.prompt || 'Untitled asset'}</strong><small>{STYLE_LABELS[record.style]} · {record.triangles / 1000}K tris</small></span>
+            {history.length > 0 && filteredHistory.length === 0 && <div className="empty-history empty-history--compact"><Search size={20} /><strong>No matches</strong><span>Try another search or turn off favorites.</span></div>}
+            {filteredHistory.map((record, index) => (
+              <button className={`history-card ${selectedLibraryId === record.id ? 'active' : ''}`} key={record.id} onClick={() => openLibraryRecord(record)}>
+                <span className={`history-thumb history-thumb--${record.assetType}`}>{record.thumbnail ? <img src={record.thumbnail} alt="" /> : <Box size={22} />}</span>
+                <span className="history-copy"><strong>{record.displayName || record.prompt || 'Untitled asset'}</strong><small>{STYLE_LABELS[record.style]} · {record.triangles / 1000}K tris{record.modelUrl ? ' · saved' : ''}</small></span>
+                {record.favorite && <Heart className="history-favorite" size={10} fill="currentColor" />}
                 {index === 0 && <span className="new-dot" />}
               </button>
             ))}
@@ -565,7 +736,7 @@ export default function App() {
         </aside>
       </section>
 
-      <footer><span>FORGECAST 0.2.0 · MULTI-ENGINE LOCAL STUDIO</span><span><Play size={11} fill="currentColor" /> Engine logs</span></footer>
+      <footer><span>FORGECAST 0.3.0 · MULTI-ENGINE LOCAL STUDIO</span><span><Play size={11} fill="currentColor" /> Engine logs</span></footer>
     </main>
   )
 }
