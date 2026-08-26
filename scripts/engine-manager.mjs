@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, join, resolve } from 'node:path'
@@ -12,6 +12,24 @@ const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'Wi
 const port = 8764
 
 mkdirSync(logsRoot, { recursive: true })
+
+const detectHardware = () => {
+  try {
+    const line = execFileSync('nvidia-smi.exe', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true,
+    }).trim().split(/\r?\n/)[0]
+    const separator = line.lastIndexOf(',')
+    const gpuName = line.slice(0, separator).trim()
+    const vramMb = Number.parseInt(line.slice(separator + 1).trim(), 10)
+    return { gpuName, vramMb, profile: vramMb >= 12288 ? 'desktop' : 'laptop' }
+  } catch {
+    return { profile: 'laptop' }
+  }
+}
+
+const hardware = detectHardware()
 
 const engines = {
   'hunyuan-mini': {
@@ -96,6 +114,7 @@ const startWorker = async (engineId) => {
 const engineState = () => ({
   activeEngine,
   workerRunning: Boolean(worker && worker.exitCode === null),
+  hardware,
   engines: Object.fromEntries(Object.entries(engines).map(([id, engine]) => [id, {
     name: engine.name,
     installed: engine.installed(),
@@ -123,6 +142,16 @@ const server = createServer(async (request, response) => {
   if (request.method === 'OPTIONS') return sendJson(response, 204, {})
   if (request.method === 'GET' && request.url === '/health') return sendJson(response, 200, { status: 'healthy' })
   if (request.method === 'GET' && request.url === '/engines') return sendJson(response, 200, engineState())
+  if (request.method === 'POST' && request.url === '/deactivate') {
+    try {
+      activation = activation.catch(() => undefined).then(() => stopWorker())
+      await activation
+      activeEngine = undefined
+      return sendJson(response, 200, engineState())
+    } catch (error) {
+      return sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
   if (request.method === 'POST' && request.url === '/activate') {
     try {
       const body = JSON.parse(await readBody(request))

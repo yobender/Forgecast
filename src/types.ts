@@ -7,6 +7,7 @@ export type ReferenceFusionMode = 'front-priority' | 'full'
 export type MaterialMode = 'shape-only' | 'pbr'
 export type ReferenceImageSet = Partial<Record<ReferenceView, File>>
 export type RealEngineId = 'hunyuan-mini' | 'hunyuan-2.1' | 'trellis-2'
+export type PerformanceMode = 'laptop' | 'desktop'
 
 export interface CastSettings {
   prompt: string
@@ -17,6 +18,7 @@ export interface CastSettings {
   materialMode?: MaterialMode
   referenceFusion?: ReferenceFusionMode
   engineId?: RealEngineId
+  performanceMode?: PerformanceMode
 }
 
 export interface CastRecord extends CastSettings {

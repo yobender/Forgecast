@@ -44,6 +44,12 @@ export const REAL_ENGINE_DEFINITIONS: Record<RealEngineId, RealEngineDefinition>
   },
 }
 
+export interface HardwareProfile {
+  gpuName?: string
+  vramMb?: number
+  profile: 'laptop' | 'desktop'
+}
+
 export interface UnifiedEngineStatus extends RealEngineDefinition {
   installed: boolean
   online: boolean
@@ -54,6 +60,7 @@ export interface UnifiedEngineStatus extends RealEngineDefinition {
   detail: string
   multiViewDownloaded?: boolean
   paintAvailable?: boolean
+  hardware?: HardwareProfile
 }
 
 export type UnifiedEngineStatuses = Record<RealEngineId, UnifiedEngineStatus>
@@ -61,6 +68,7 @@ export type UnifiedEngineStatuses = Record<RealEngineId, UnifiedEngineStatus>
 interface ManagerState {
   activeEngine?: RealEngineId
   engines?: Partial<Record<RealEngineId, { installed?: boolean }>>
+  hardware?: HardwareProfile
 }
 
 interface StandardJob {
@@ -133,6 +141,7 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
     detectTrellis2(),
   ])
   const active = manager.activeEngine
+  const hardware = manager.hardware
   const installed = (id: RealEngineId, online: boolean) => Boolean(manager.engines?.[id]?.installed || online)
   const inactiveLabel = (id: RealEngineId) => active && active !== id ? 'Installed · inactive' : 'Installed · starting'
 
@@ -147,6 +156,7 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
       multiViewDownloaded: mini.multiViewDownloaded,
       label: mini.apiOnline ? mini.label : installed('hunyuan-mini', false) ? inactiveLabel('hunyuan-mini') : 'Not installed',
       detail: mini.apiOnline ? 'Fast shape engine; supports exact-turntable multi-view fusion.' : REAL_ENGINE_DEFINITIONS['hunyuan-mini'].description,
+      hardware,
     },
     'hunyuan-2.1': {
       ...baseStatus('hunyuan-2.1'),
@@ -158,6 +168,7 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
       paintAvailable: hunyuan21.paintAvailable,
       label: hunyuan21.online ? (hunyuan21.modelLoaded ? 'Hunyuan3D 2.1 ready' : 'Ready · model loads on first cast') : installed('hunyuan-2.1', false) ? inactiveLabel('hunyuan-2.1') : 'Not installed',
       detail: hunyuan21.message || REAL_ENGINE_DEFINITIONS['hunyuan-2.1'].description,
+      hardware,
     },
     'trellis-2': {
       ...baseStatus('trellis-2'),
@@ -168,6 +179,7 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
       modelDownloaded: trellis2.modelLoaded,
       label: trellis2.online ? (trellis2.modelLoaded ? 'TRELLIS.2 ready' : 'Ready · 4B model loads on first cast') : installed('trellis-2', false) ? inactiveLabel('trellis-2') : 'Not installed',
       detail: trellis2.message || REAL_ENGINE_DEFINITIONS['trellis-2'].description,
+      hardware,
     },
   }
 }
@@ -179,6 +191,21 @@ export async function activateRealEngine(engineId: RealEngineId): Promise<boolea
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ engineId }),
       signal: AbortSignal.timeout(5000),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+export async function releaseRealEngineGpu(engineId: RealEngineId): Promise<boolean> {
+  try {
+    const url = engineId === 'hunyuan-mini' ? 'http://127.0.0.1:8765/model/unload-all' : `${MANAGER_BASE}/deactivate`
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: engineId === 'hunyuan-mini' ? undefined : JSON.stringify({ engineId }),
+      signal: AbortSignal.timeout(10000),
     })
     return response.ok
   } catch {

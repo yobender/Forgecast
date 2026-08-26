@@ -6,12 +6,12 @@ import { AssetViewer, type AssetViewerHandle } from './components/AssetViewer'
 import { BrandMark } from './components/BrandMark'
 import { StageRail } from './components/StageRail'
 import { mockEngine } from './engine/mockEngine'
-import { activateRealEngine, detectRealEngines, generateWithRealEngine, REAL_ENGINE_DEFINITIONS, type UnifiedEngineStatuses } from './engine/realEngines'
+import { activateRealEngine, detectRealEngines, generateWithRealEngine, releaseRealEngineGpu, REAL_ENGINE_DEFINITIONS, type UnifiedEngineStatuses } from './engine/realEngines'
 import { buildStyleConditioning } from './engine/styleRecipes'
 import { loadHistory, saveHistory } from './lib/history'
 import { slugify } from './lib/naming'
-import { HUNYUAN_PBR_HINTS, QUALITY_LABELS, STYLE_LABELS } from './lib/presets'
-import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshQuality, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
+import { HUNYUAN_PBR_HINTS, miniQualityProfile, QUALITY_LABELS, STYLE_LABELS } from './lib/presets'
+import type { ArtStyle, AssetType, CastRecord, GenerationStage, MaterialMode, MeshQuality, PerformanceMode, RealEngineId, ReferenceFusionMode, ReferenceImageSet, ReferenceView } from './types'
 
 const DEFAULT_PROMPT = ''
 const REFERENCE_VIEWS: ReferenceView[] = ['front', 'back', 'left', 'right', 'top', 'bottom']
@@ -22,6 +22,11 @@ const DEFAULT_ENGINE: RealEngineId = 'hunyuan-mini'
 const savedEngine = (): RealEngineId => {
   const value = localStorage.getItem('forgecast-engine')
   return value && Object.hasOwn(REAL_ENGINE_DEFINITIONS, value) ? value as RealEngineId : DEFAULT_ENGINE
+}
+type PerformanceSetting = 'auto' | PerformanceMode
+const savedPerformance = (): PerformanceSetting => {
+  const value = localStorage.getItem('forgecast-performance')
+  return value === 'laptop' || value === 'desktop' ? value : 'auto'
 }
 const initialEngineStatuses = (): UnifiedEngineStatuses => Object.fromEntries(
   (Object.keys(REAL_ENGINE_DEFINITIONS) as RealEngineId[]).map((id) => [id, {
@@ -64,6 +69,7 @@ export default function App() {
   const [seed, setSeed] = useState(483921)
   const [materialMode, setMaterialMode] = useState<MaterialMode>('pbr')
   const [selectedEngine, setSelectedEngine] = useState<RealEngineId>(savedEngine)
+  const [performanceSetting, setPerformanceSetting] = useState<PerformanceSetting>(savedPerformance)
   const [stage, setStage] = useState<GenerationStage>(DEV_MODEL_URL ? 'complete' : 'idle')
   const [progress, setProgress] = useState(DEV_MODEL_URL ? 100 : 0)
   const [history, setHistory] = useState<CastRecord[]>(loadHistory)
@@ -78,6 +84,7 @@ export default function App() {
   const [engineMessage, setEngineMessage] = useState('')
   const [generationError, setGenerationError] = useState('')
   const [engineStatuses, setEngineStatuses] = useState<UnifiedEngineStatuses>(initialEngineStatuses)
+  const [releasingGpu, setReleasingGpu] = useState(false)
   const viewerRef = useRef<AssetViewerHandle>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const batchFileInputRef = useRef<HTMLInputElement>(null)
@@ -88,10 +95,17 @@ export default function App() {
   const shapeReferenceCount = REFERENCE_VIEWS.filter((view) => SHAPE_VIEWS.has(view) && referenceFiles[view]).length
   const realEngine = engineStatuses[selectedEngine]
   const engineDefinition = REAL_ENGINE_DEFINITIONS[selectedEngine]
+  const hardware = engineStatuses['hunyuan-mini'].hardware
+  const resolvedPerformance: PerformanceMode = performanceSetting === 'auto' ? hardware?.profile ?? 'laptop' : performanceSetting
+  const laptopMode = resolvedPerformance === 'laptop'
+  const miniProfile = miniQualityProfile(quality, laptopMode)
+  const displayTriangles = selectedEngine === 'hunyuan-mini' ? miniProfile.triangles : QUALITY_LABELS[quality].triangles
+  const liveTextureSize = laptopMode ? 1024 : 2048
+  const desktopEngineBlocked = laptopMode && selectedEngine !== 'hunyuan-mini'
   const engineStarting = realEngine.installed && !realEngine.ready
   const multiViewInstalling = selectedEngine === 'hunyuan-mini' && realEngine.ready && referenceCount > 1 && referenceFusion === 'full' && !realEngine.multiViewDownloaded
   const hunyuanPaintBlocked = selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' && realEngine.ready && realEngine.paintAvailable === false
-  const hasPbrOutput = Boolean(modelUrl) && (selectedEngine === 'trellis-2' || (selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr'))
+  const hasPbrOutput = Boolean(modelUrl) && materialMode === 'pbr'
 
   const selectReferenceFile = useCallback((view: ReferenceView, file: File | null) => {
     if (!file) return
@@ -187,8 +201,16 @@ export default function App() {
     localStorage.setItem('forgecast-engine', selectedEngine)
     setGenerationError('')
     setModelUrl('')
-    void activateRealEngine(selectedEngine)
+    if (selectedEngine === 'trellis-2') setMaterialMode('pbr')
   }, [selectedEngine])
+
+  useEffect(() => {
+    localStorage.setItem('forgecast-performance', performanceSetting)
+  }, [performanceSetting])
+
+  useEffect(() => {
+    if (!desktopEngineBlocked) void activateRealEngine(selectedEngine)
+  }, [desktopEngineBlocked, selectedEngine])
 
   useEffect(() => {
     let active = true
@@ -201,7 +223,22 @@ export default function App() {
     return () => { active = false; window.clearInterval(timer) }
   }, [])
 
+  useEffect(() => {
+    if (!laptopMode || selectedEngine !== 'hunyuan-mini' || running || stage !== 'complete') return
+    const timer = window.setTimeout(() => { void releaseRealEngineGpu('hunyuan-mini') }, 3 * 60 * 1000)
+    return () => window.clearTimeout(timer)
+  }, [laptopMode, running, selectedEngine, stage])
+
+  const releaseGpu = async () => {
+    if (running || releasingGpu) return
+    setReleasingGpu(true)
+    const released = await releaseRealEngineGpu(selectedEngine)
+    setEngineMessage(released ? 'GPU memory released. The model will reload on the next cast.' : 'Could not release the GPU worker.')
+    setReleasingGpu(false)
+  }
+
   const statusText = useMemo(() => {
+    if (/GPU (memory|worker)/i.test(engineMessage)) return engineMessage
     if (stage === 'idle') return realEngine.ready ? `${engineDefinition.name} ready` : 'Demo preview ready'
     if (stage === 'complete') return modelUrl ? 'Real asset generated locally' : 'Demo preview complete · no AI model generated'
     return engineMessage || `Simulating ${stage} stage`
@@ -209,6 +246,10 @@ export default function App() {
 
   const startCast = async () => {
     if (running) return
+    if (desktopEngineBlocked) {
+      setGenerationError(`${engineDefinition.name} is reserved for the 4090 desktop. Choose Hunyuan Mini, or change Performance profile to Desktop full if you want to override the safety check.`)
+      return
+    }
     if (!referenceFiles.front && realEngine.ready) {
       setGenerationError('Add a front reference first. It anchors the other views to the same object and pose.')
       openReferencePicker('front')
@@ -227,13 +268,18 @@ export default function App() {
       return
     }
     const runRealEngine = realEngine.ready && referenceCount > 0
-    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine }
+    const settings = { prompt, assetType, style, quality, seed, materialMode, referenceFusion, engineId: selectedEngine, performanceMode: resolvedPerformance }
+    const previousModelUrl = modelUrl
     setProgress(1)
     setStage('concept')
     setExportOpen(false)
     setGenerationError('')
     setEngineMessage(runRealEngine ? 'Preparing local AI engine…' : 'Simulating concept stage')
     try {
+      if (runRealEngine && previousModelUrl) {
+        setModelUrl('')
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+      }
       const onProgress = ({ percent, stage: nextStage, message }: { percent: number; stage: Exclude<GenerationStage, 'idle' | 'complete'>; message: string }) => {
         setProgress(percent)
         setStage(nextStage)
@@ -258,6 +304,7 @@ export default function App() {
       setGenerationError(error instanceof Error ? error.message : 'Generation failed')
       setProgress(0)
       setStage('idle')
+      setModelUrl(previousModelUrl)
     }
   }
 
@@ -268,6 +315,7 @@ export default function App() {
     setQuality(record.quality)
     setSeed(record.seed)
     setMaterialMode(record.materialMode ?? 'pbr')
+    if (record.performanceMode) setPerformanceSetting(record.performanceMode)
     setReferenceFusion(record.referenceFusion ?? 'front-priority')
     if (record.engineId) setSelectedEngine(record.engineId)
     setModelUrl('')
@@ -284,6 +332,7 @@ export default function App() {
       quality,
       seed,
       materialMode,
+      performanceMode: resolvedPerformance,
       referenceFusion,
       engine: modelUrl ? selectedEngine : 'mock',
       referenceViews: Object.keys(referenceFiles),
@@ -303,10 +352,17 @@ export default function App() {
   const exportGlb = () => {
     const object = viewerRef.current?.getObject()
     if (!object) return
+    const restoreLiveTextures = viewerRef.current?.preparePbrExport(2048) ?? (() => undefined)
     new GLTFExporter().parse(
       object,
-      (data) => downloadBlob(new Blob([data as ArrayBuffer], { type: 'model/gltf-binary' }), `${slugify(prompt)}.glb`),
-      (error) => console.error('GLB export failed', error),
+      (data) => {
+        restoreLiveTextures()
+        downloadBlob(new Blob([data as ArrayBuffer], { type: 'model/gltf-binary' }), `${slugify(prompt)}.glb`)
+      },
+      (error) => {
+        restoreLiveTextures()
+        console.error('GLB export failed', error)
+      },
       { binary: true, onlyVisible: true },
     )
   }
@@ -332,8 +388,14 @@ export default function App() {
 
           <div className="field-group engine-picker">
             <label htmlFor="engine">Generation engine</label>
-            <div className="select-wrap"><select id="engine" value={selectedEngine} onChange={(event) => setSelectedEngine(event.target.value as RealEngineId)}>{(Object.keys(REAL_ENGINE_DEFINITIONS) as RealEngineId[]).map((id) => <option value={id} key={id}>{REAL_ENGINE_DEFINITIONS[id].name}{engineStatuses[id].installed ? '' : ' · not installed'}</option>)}</select><ChevronDown size={14} /></div>
+            <div className="select-wrap"><select id="engine" value={selectedEngine} onChange={(event) => setSelectedEngine(event.target.value as RealEngineId)}>{(Object.keys(REAL_ENGINE_DEFINITIONS) as RealEngineId[]).map((id) => <option value={id} key={id}>{REAL_ENGINE_DEFINITIONS[id].name}{laptopMode && id !== 'hunyuan-mini' ? ' · desktop only' : engineStatuses[id].installed ? '' : ' · not installed'}</option>)}</select><ChevronDown size={14} /></div>
             <small><strong>{engineDefinition.output}</strong> · {engineDefinition.description}</small>
+          </div>
+
+          <div className="field-group engine-picker">
+            <label htmlFor="performance">Performance profile</label>
+            <div className="select-wrap"><select id="performance" value={performanceSetting} onChange={(event) => setPerformanceSetting(event.target.value as PerformanceSetting)}><option value="auto">Auto · {hardware?.profile === 'desktop' ? 'desktop full' : 'laptop safe'}</option><option value="laptop">Laptop safe</option><option value="desktop">Desktop full</option></select><ChevronDown size={14} /></div>
+            <small>{hardware?.gpuName ? `${hardware.gpuName}${hardware.vramMb ? ` · ${(hardware.vramMb / 1024).toFixed(1)} GB VRAM` : ''}` : 'Safe laptop limits are used until GPU detection is available.'}</small>
           </div>
 
           <div className="field-group">
@@ -385,35 +447,37 @@ export default function App() {
           </div>
 
           <div className="field-group settings-row">
-            <div><label>{selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' ? 'Cast quality' : 'Mesh quality'}</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => <option value={key} key={key}>{QUALITY_LABELS[key].label} · {QUALITY_LABELS[key].triangles / 1000}K</option>)}</select><ChevronDown size={14} /></div></div>
+            <div><label>{selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' ? 'Cast quality' : 'Mesh quality'}</label><div className="select-wrap"><select value={quality} onChange={(event) => setQuality(event.target.value as MeshQuality)}>{(Object.keys(QUALITY_LABELS) as MeshQuality[]).map((key) => <option value={key} key={key}>{QUALITY_LABELS[key].label} · {(selectedEngine === 'hunyuan-mini' ? miniQualityProfile(key, laptopMode).triangles : QUALITY_LABELS[key].triangles) / 1000}K</option>)}</select><ChevronDown size={14} /></div></div>
             <div><label>Seed</label><input className="seed-input" value={seed} onChange={(event) => setSeed(Number(event.target.value))} type="number" /></div>
           </div>
 
           {selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' && <div className="baked-style-note"><Sparkles size={12} /> {HUNYUAN_PBR_HINTS[quality]}</div>}
 
-          {selectedEngine === 'hunyuan-2.1' && <div className="field-group">
+          {selectedEngine !== 'trellis-2' && <div className="field-group">
             <label>Material output</label>
             <div className="segmented">
-              <button className={materialMode === 'pbr' ? 'active' : ''} type="button" disabled={realEngine.paintAvailable === false} onClick={() => setMaterialMode('pbr')}>PBR color</button>
-              <button className={materialMode === 'shape-only' ? 'active' : ''} type="button" onClick={() => setMaterialMode('shape-only')}>Shape only</button>
+              <button className={materialMode === 'pbr' ? 'active' : ''} type="button" disabled={selectedEngine === 'hunyuan-2.1' && realEngine.paintAvailable === false} onClick={() => setMaterialMode('pbr')}>{selectedEngine === 'hunyuan-mini' ? 'Color asset' : 'PBR color'}</button>
+              <button className={materialMode === 'shape-only' ? 'active' : ''} type="button" onClick={() => setMaterialMode('shape-only')}>{selectedEngine === 'hunyuan-mini' ? 'Print STL' : 'Shape only'}</button>
             </div>
-            <small>{materialMode === 'pbr' ? 'Generates shape, frees VRAM, then paints UV-aligned albedo and metallic/roughness maps.' : 'Faster geometry-only output for STL printing or manual materials.'}</small>
+            <small>{materialMode === 'pbr' ? (selectedEngine === 'hunyuan-mini' ? `${liveTextureSize / 1024}K live detail materials; GLB export is prepared at 2K.` : 'Generates shape, frees VRAM, then paints UV-aligned albedo and metallic/roughness maps.') : 'Faster geometry-only output for STL printing or manual materials.'}</small>
           </div>}
+
+          {desktopEngineBlocked && <div className="baked-style-note"><Cpu size={12} /> Desktop-only engine blocked by Laptop safe mode. Use Hunyuan Mini here, or explicitly choose Desktop full to override.</div>}
 
           <div className={`engine-note ${realEngine.ready ? 'engine-note--ready' : ''}`}><Cpu size={16} /><span><strong>{realEngine.ready ? (referenceCount > 1 ? (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? 'Front-only generation ready' : multiViewInstalling ? 'Multi-view model is installing' : `${shapeReferenceCount}-view full fusion ready`) : referenceFiles.front ? `${engineDefinition.shortName} ready` : 'Add a front reference') : engineStarting ? `${engineDefinition.shortName} is starting` : 'Demo mode only — prompts are not generated'}</strong><small>{realEngine.ready ? (referenceCount > 1 && (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView) ? 'Uses the front reference; other loaded slots are ignored by this engine.' : realEngine.detail) : engineStarting ? 'The engine manager is switching workers. This usually takes a few seconds; model weights load on the first cast.' : `${realEngine.label}. ${realEngine.detail}`}</small></span></div>
           {generationError && <div className="generation-error">{generationError}</div>}
 
-          <button className="cast-button" onClick={startCast} disabled={running || multiViewInstalling || engineStarting || hunyuanPaintBlocked}>
-            {running ? <><RefreshCw className="spin" size={18} /> {realEngine.ready ? 'GENERATING' : 'SIMULATING'} · {progress}%</> : <><WandSparkles size={19} /> {engineStarting ? 'STARTING ENGINE' : realEngine.ready ? (multiViewInstalling ? 'INSTALLING MULTI-VIEW MODEL' : referenceCount > 1 ? (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : `FUSE ${referenceCount} REFERENCES`) : referenceFiles.front ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : 'ADD FRONT REFERENCE') : (stage === 'complete' ? 'RE-RUN DEMO' : 'RUN DEMO PREVIEW')}</>}
+          <button className="cast-button" onClick={startCast} disabled={running || multiViewInstalling || engineStarting || hunyuanPaintBlocked || desktopEngineBlocked}>
+            {running ? <><RefreshCw className="spin" size={18} /> {realEngine.ready ? 'GENERATING' : 'SIMULATING'} · {progress}%</> : <><WandSparkles size={19} /> {desktopEngineBlocked ? 'DESKTOP ENGINE · CHANGE PROFILE' : engineStarting ? 'STARTING ENGINE' : realEngine.ready ? (multiViewInstalling ? 'INSTALLING MULTI-VIEW MODEL' : referenceCount > 1 ? (referenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : `FUSE ${referenceCount} REFERENCES`) : referenceFiles.front ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : 'ADD FRONT REFERENCE') : (stage === 'complete' ? 'RE-RUN DEMO' : 'RUN DEMO PREVIEW')}</>}
           </button>
         </aside>
 
         <section className="viewer-panel">
           <div className="viewer-toolbar">
-            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {QUALITY_LABELS[quality].triangles.toLocaleString()} tris</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? 'PBR GLB' : engineDefinition.output}</span>}</div>
-            <div><button className={`tool-button ${autoRotate ? 'active' : ''}`} onClick={() => setAutoRotate((value) => !value)}><Rotate3D size={15} /> {autoRotate ? 'Rotating' : 'Orbit'}</button><button className={`tool-button ${wireframe ? 'active' : ''}`} onClick={() => setWireframe((value) => !value)}>Wireframe</button></div>
+            <div><span className="pill"><Box size={13} /> {assetType}</span><span className="pill"><Layers3 size={13} /> {displayTriangles.toLocaleString()} tris</span>{modelUrl && <span className="pill"><Sparkles size={13} /> {hasPbrOutput ? `${liveTextureSize / 1024}K live PBR` : 'Print geometry'}</span>}</div>
+            <div><button className="tool-button" disabled={running || releasingGpu || !realEngine.online} onClick={releaseGpu}><Cpu size={15} /> {releasingGpu ? 'Releasing…' : 'Free GPU'}</button><button className={`tool-button ${autoRotate ? 'active' : ''}`} onClick={() => setAutoRotate((value) => !value)}><Rotate3D size={15} /> {autoRotate ? 'Rotating' : 'Orbit'}</button><button className={`tool-button ${wireframe ? 'active' : ''}`} onClick={() => setWireframe((value) => !value)}>Wireframe</button></div>
           </div>
-          <div className="viewer-canvas">{!modelUrl && <div className="demo-watermark"><strong>DEMO GEOMETRY</strong><span>Not generated from your prompt</span></div>}<AssetViewer ref={viewerRef} type={assetType} style={style} wireframe={wireframe} autoRotate={autoRotate} modelUrl={modelUrl || undefined} /></div>
+          <div className="viewer-canvas">{!modelUrl && <div className="demo-watermark"><strong>DEMO GEOMETRY</strong><span>Not generated from your prompt</span></div>}<AssetViewer ref={viewerRef} type={assetType} style={style} wireframe={wireframe} autoRotate={autoRotate} modelUrl={modelUrl || undefined} detailTextureSize={liveTextureSize} proceduralPbr={materialMode === 'pbr'} /></div>
           <div className="viewer-caption"><span>Drag to orbit · Scroll to zoom · Right-drag to pan</span><span>{modelUrl ? 'Real local AI output' : 'Procedural demo geometry'}</span></div>
 
           <div className="generation-dock">
@@ -424,7 +488,7 @@ export default function App() {
             <div className="progress-wrap"><StageRail stage={stage} /><div className="progress-track"><span style={{ width: `${progress}%` }} /></div></div>
             <div className="export-wrap">
               <button className="export-button" disabled={stage !== 'complete'} onClick={() => setExportOpen((value) => !value)}><Download size={16} /> Export <ChevronDown size={14} /></button>
-              {exportOpen && <div className="export-menu"><button onClick={exportGlb}>{hasPbrOutput ? 'PBR Color GLB' : modelUrl ? 'Geometry GLB' : 'Demo GLB'} <span>{hasPbrOutput ? 'UV color + metallic/roughness maps' : modelUrl ? 'Mesh with its generated material data' : 'Procedural colors'}</span></button><button onClick={exportStl}>{modelUrl ? 'Print STL' : 'Demo STL'} <span>Geometry only · no color</span></button><button onClick={exportRecipe}>Recipe <span>Prompt + settings</span></button><button disabled>FBX <span>Coming later</span></button></div>}
+              {exportOpen && <div className="export-menu"><button onClick={exportGlb}>{hasPbrOutput ? '2K PBR Color GLB' : modelUrl ? 'Geometry GLB' : 'Demo GLB'} <span>{hasPbrOutput ? 'Temporarily builds final 2K material maps' : modelUrl ? 'Mesh with its generated material data' : 'Procedural colors'}</span></button><button onClick={exportStl}>{modelUrl ? 'Print STL' : 'Demo STL'} <span>Geometry only · no color</span></button><button onClick={exportRecipe}>Recipe <span>Prompt + settings</span></button><button disabled>FBX <span>Coming later</span></button></div>}
             </div>
           </div>
         </section>
@@ -443,7 +507,7 @@ export default function App() {
           </div>
           <div className="system-card">
             <div><span className="status-light" /><strong>System ready</strong></div>
-            <dl><dt>GPU</dt><dd>Local NVIDIA GPU</dd><dt>Engine</dt><dd>{realEngine.ready ? engineDefinition.shortName : engineStarting ? 'Starting…' : 'Demo adapter'}</dd><dt>Queue</dt><dd>{running ? '1 active' : 'Idle'}</dd></dl>
+            <dl><dt>GPU</dt><dd>{hardware?.gpuName || 'Local NVIDIA GPU'}</dd><dt>Profile</dt><dd>{laptopMode ? 'Laptop safe' : 'Desktop full'}</dd><dt>Engine</dt><dd>{realEngine.ready ? engineDefinition.shortName : engineStarting ? 'Starting…' : 'Demo adapter'}</dd><dt>Queue</dt><dd>{running ? '1 active' : 'Idle'}</dd></dl>
           </div>
         </aside>
       </section>

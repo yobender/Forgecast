@@ -6,6 +6,7 @@ import type { ArtStyle, AssetType } from '../types'
 
 export interface AssetViewerHandle {
   getObject: () => THREE.Object3D | null
+  preparePbrExport: (textureSize: number) => () => void
 }
 
 const PALETTES: Record<ArtStyle, [string, string, string]> = {
@@ -22,7 +23,6 @@ function Material({ color, roughness = 0.7 }: { color: string; roughness?: numbe
 }
 
 const WIREFRAME_OVERLAY = '__forgecast_wireframe__'
-const PBR_TEXTURE_SIZE = 2048
 
 type SurfaceKind = 'metal' | 'leather' | 'crystal'
 
@@ -32,27 +32,32 @@ interface SurfaceTextures {
   orm: THREE.CanvasTexture
 }
 
-const surfaceTextureCache = new Map<SurfaceKind, SurfaceTextures>()
+const surfaceTextureCache = new Map<string, SurfaceTextures>()
 
-function makeSurfaceTextures(kind: SurfaceKind): SurfaceTextures {
-  const cached = surfaceTextureCache.get(kind)
+function surfaceTextureKey(kind: SurfaceKind, textureSize: number) {
+  return `${kind}-${textureSize}`
+}
+
+function makeSurfaceTextures(kind: SurfaceKind, textureSize: number): SurfaceTextures {
+  const cacheKey = surfaceTextureKey(kind, textureSize)
+  const cached = surfaceTextureCache.get(cacheKey)
   if (cached) return cached
 
   const detailCanvas = document.createElement('canvas')
   const normalCanvas = document.createElement('canvas')
   const ormCanvas = document.createElement('canvas')
-  detailCanvas.width = normalCanvas.width = ormCanvas.width = PBR_TEXTURE_SIZE
-  detailCanvas.height = normalCanvas.height = ormCanvas.height = PBR_TEXTURE_SIZE
+  detailCanvas.width = normalCanvas.width = ormCanvas.width = textureSize
+  detailCanvas.height = normalCanvas.height = ormCanvas.height = textureSize
   const detailContext = detailCanvas.getContext('2d')!
   const normalContext = normalCanvas.getContext('2d')!
   const ormContext = ormCanvas.getContext('2d')!
-  const detailImage = detailContext.createImageData(PBR_TEXTURE_SIZE, PBR_TEXTURE_SIZE)
-  const normalImage = normalContext.createImageData(PBR_TEXTURE_SIZE, PBR_TEXTURE_SIZE)
-  const ormImage = ormContext.createImageData(PBR_TEXTURE_SIZE, PBR_TEXTURE_SIZE)
+  const detailImage = detailContext.createImageData(textureSize, textureSize)
+  const normalImage = normalContext.createImageData(textureSize, textureSize)
+  const ormImage = ormContext.createImageData(textureSize, textureSize)
 
-  for (let y = 0; y < PBR_TEXTURE_SIZE; y += 1) {
-    for (let x = 0; x < PBR_TEXTURE_SIZE; x += 1) {
-      const pixel = (y * PBR_TEXTURE_SIZE + x) * 4
+  for (let y = 0; y < textureSize; y += 1) {
+    for (let x = 0; x < textureSize; x += 1) {
+      const pixel = (y * textureSize + x) * 4
       const grain = ((x * 37) ^ (y * 73) ^ ((x * y) >>> 4)) & 255
       const fine = grain - 127
       let nx = fine * 0.12
@@ -116,12 +121,22 @@ function makeSurfaceTextures(kind: SurfaceKind): SurfaceTextures {
     return texture
   }
   const textures = {
-    detail: makeTexture(detailCanvas, `Forgecast ${kind} 2K color detail`, true),
-    normal: makeTexture(normalCanvas, `Forgecast ${kind} 2K normal`),
-    orm: makeTexture(ormCanvas, `Forgecast ${kind} 2K ORM`),
+    detail: makeTexture(detailCanvas, `Forgecast ${kind} ${textureSize} color detail`, true),
+    normal: makeTexture(normalCanvas, `Forgecast ${kind} ${textureSize} normal`),
+    orm: makeTexture(ormCanvas, `Forgecast ${kind} ${textureSize} ORM`),
   }
-  surfaceTextureCache.set(kind, textures)
+  surfaceTextureCache.set(cacheKey, textures)
   return textures
+}
+
+function applySurfaceTextures(material: THREE.MeshStandardMaterial, kind: SurfaceKind, textureSize: number) {
+  const textures = makeSurfaceTextures(kind, textureSize)
+  material.map = textures.detail
+  material.normalMap = textures.normal
+  material.roughnessMap = textures.orm
+  material.metalnessMap = textures.orm
+  material.userData.forgecastSurface = kind
+  material.needsUpdate = true
 }
 
 function addProjectedUVs(geometry: THREE.BufferGeometry) {
@@ -167,22 +182,15 @@ function addProjectedUVs(geometry: THREE.BufferGeometry) {
   return projected
 }
 
-function buildSurfaceMaterials() {
+function buildSurfaceMaterials(textureSize: number) {
   const common = { vertexColors: true, color: new THREE.Color('#ffffff') }
-  const metal = makeSurfaceTextures('metal')
-  const leather = makeSurfaceTextures('leather')
-  const crystal = makeSurfaceTextures('crystal')
-  return [
-    new THREE.MeshStandardMaterial({ ...common, name: 'Forgecast metal', map: metal.detail, normalMap: metal.normal, normalScale: new THREE.Vector2(0.34, 0.34), roughnessMap: metal.orm, metalnessMap: metal.orm, roughness: 1, metalness: 1, envMapIntensity: 0.62 }),
-    new THREE.MeshStandardMaterial({ ...common, name: 'Forgecast leather', map: leather.detail, normalMap: leather.normal, normalScale: new THREE.Vector2(0.4, 0.4), roughnessMap: leather.orm, metalnessMap: leather.orm, roughness: 1, metalness: 1, envMapIntensity: 0.24 }),
+  const materials = [
+    new THREE.MeshStandardMaterial({ ...common, name: 'Forgecast metal', normalScale: new THREE.Vector2(0.34, 0.34), roughness: 1, metalness: 1, envMapIntensity: 0.62 }),
+    new THREE.MeshStandardMaterial({ ...common, name: 'Forgecast leather', normalScale: new THREE.Vector2(0.4, 0.4), roughness: 1, metalness: 1, envMapIntensity: 0.24 }),
     new THREE.MeshStandardMaterial({
       ...common,
       name: 'Forgecast frost crystal',
-      map: crystal.detail,
-      normalMap: crystal.normal,
       normalScale: new THREE.Vector2(0.28, 0.28),
-      roughnessMap: crystal.orm,
-      metalnessMap: crystal.orm,
       roughness: 1,
       metalness: 1,
       envMapIntensity: 0.72,
@@ -190,9 +198,11 @@ function buildSurfaceMaterials() {
       emissiveIntensity: 0.32,
     }),
   ]
+  ;(['metal', 'leather', 'crystal'] as SurfaceKind[]).forEach((kind, index) => applySurfaceTextures(materials[index], kind, textureSize))
+  return materials
 }
 
-function applyColorAwareMaterials(mesh: THREE.Mesh) {
+function applyColorAwareMaterials(mesh: THREE.Mesh, textureSize: number) {
   let geometry = mesh.geometry.clone()
   // Some Hunyuan outputs contain positions and vertex colors but omit
   // normals entirely. MeshStandardMaterial cannot light those meshes, which
@@ -201,7 +211,7 @@ function applyColorAwareMaterials(mesh: THREE.Mesh) {
   mesh.geometry = geometry
   const colors = geometry.getAttribute('color')
   const index = geometry.getIndex()
-  const materials = buildSurfaceMaterials()
+  const materials = buildSurfaceMaterials(textureSize)
 
   if (!colors || !index) {
     mesh.material = materials[0]
@@ -233,9 +243,89 @@ function applyColorAwareMaterials(mesh: THREE.Mesh) {
     writeOffset += triangleIndexes.length
   })
   geometry.setIndex(new THREE.BufferAttribute(sortedIndex, 1))
-  geometry = addProjectedUVs(geometry)
-  mesh.geometry = geometry
+  const projectedGeometry = addProjectedUVs(geometry)
+  geometry.dispose()
+  mesh.geometry = projectedGeometry
   mesh.material = materials
+}
+
+function hasNativePbrMaterial(mesh: THREE.Mesh) {
+  const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  return materials.some((material) => material instanceof THREE.MeshStandardMaterial && Boolean(
+    material.map || material.normalMap || material.roughnessMap || material.metalnessMap,
+  ))
+}
+
+function applyLightweightVertexMaterial(mesh: THREE.Mesh) {
+  const geometry = mesh.geometry.clone()
+  if (!geometry.hasAttribute('normal')) geometry.computeVertexNormals()
+  mesh.geometry = geometry
+  mesh.material = new THREE.MeshStandardMaterial({
+    name: 'Forgecast print preview',
+    vertexColors: geometry.hasAttribute('color'),
+    color: '#ffffff',
+    roughness: 0.82,
+    metalness: 0.08,
+  })
+}
+
+function disposeLoadedClone(root: THREE.Object3D) {
+  clearWireframeOverlay(root)
+  root.traverse((object) => {
+    if (!(object instanceof THREE.Mesh)) return
+    object.geometry.dispose()
+    const materials = Array.isArray(object.material) ? object.material : [object.material]
+    materials.forEach((material) => material.dispose())
+  })
+}
+
+function preparePbrTextureExport(root: THREE.Object3D | null, textureSize: number) {
+  if (!root) return () => undefined
+  const changes: Array<{
+    material: THREE.MeshStandardMaterial
+    map: THREE.Texture | null
+    normalMap: THREE.Texture | null
+    roughnessMap: THREE.Texture | null
+    metalnessMap: THREE.Texture | null
+  }> = []
+  const temporaryKeys = new Set<string>()
+
+  root.traverse((object) => {
+    if (!(object instanceof THREE.Mesh)) return
+    const materials = Array.isArray(object.material) ? object.material : [object.material]
+    materials.forEach((material) => {
+      if (!(material instanceof THREE.MeshStandardMaterial)) return
+      const kind = material.userData.forgecastSurface as SurfaceKind | undefined
+      if (!kind) return
+      changes.push({
+        material,
+        map: material.map,
+        normalMap: material.normalMap,
+        roughnessMap: material.roughnessMap,
+        metalnessMap: material.metalnessMap,
+      })
+      temporaryKeys.add(surfaceTextureKey(kind, textureSize))
+      applySurfaceTextures(material, kind, textureSize)
+    })
+  })
+
+  return () => {
+    changes.forEach(({ material, map, normalMap, roughnessMap, metalnessMap }) => {
+      material.map = map
+      material.normalMap = normalMap
+      material.roughnessMap = roughnessMap
+      material.metalnessMap = metalnessMap
+      material.needsUpdate = true
+    })
+    temporaryKeys.forEach((key) => {
+      const textures = surfaceTextureCache.get(key)
+      if (!textures || changes.some(({ map }) => map === textures.detail)) return
+      textures.detail.dispose()
+      textures.normal.dispose()
+      textures.orm.dispose()
+      surfaceTextureCache.delete(key)
+    })
+  }
 }
 
 function clearWireframeOverlay(root: THREE.Object3D) {
@@ -351,13 +441,14 @@ const GeneratedAsset = forwardRef<THREE.Group, { type: AssetType; style: ArtStyl
   )
 })
 
-const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean }>(({ url, style, wireframe }, ref) => {
+const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean; detailTextureSize: number; proceduralPbr: boolean }>(({ url, style, wireframe, detailTextureSize, proceduralPbr }, ref) => {
   const { scene } = useGLTF(url)
   const clone = useMemo(() => {
     const result = scene.clone(true)
     result.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return
-      if (object.geometry.hasAttribute('color')) applyColorAwareMaterials(object)
+      if (object.geometry.hasAttribute('color') && proceduralPbr && !hasNativePbrMaterial(object)) applyColorAwareMaterials(object, detailTextureSize)
+      else if (object.geometry.hasAttribute('color') && !proceduralPbr) applyLightweightVertexMaterial(object)
       else {
         object.geometry = object.geometry.clone()
         if (!object.geometry.hasAttribute('normal')) object.geometry.computeVertexNormals()
@@ -367,7 +458,7 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
       }
     })
     return result
-  }, [scene])
+  }, [detailTextureSize, proceduralPbr, scene])
   const group = useRef<THREE.Group>(null)
   useImperativeHandle(ref, () => group.current as THREE.Group)
 
@@ -408,12 +499,20 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
     return () => clearWireframeOverlay(clone)
   }, [clone, style, wireframe])
 
+  useEffect(() => () => {
+    disposeLoadedClone(clone)
+    useGLTF.clear(url)
+  }, [clone, url])
+
   return <group ref={group}><primitive object={clone} /></group>
 })
 
-export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string }>(({ type, style, wireframe = false, autoRotate = false, modelUrl }, ref) => {
+export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string; detailTextureSize?: number; proceduralPbr?: boolean }>(({ type, style, wireframe = false, autoRotate = false, modelUrl, detailTextureSize = 1024, proceduralPbr = true }, ref) => {
   const asset = useRef<THREE.Group>(null)
-  useImperativeHandle(ref, () => ({ getObject: () => asset.current }))
+  useImperativeHandle(ref, () => ({
+    getObject: () => asset.current,
+    preparePbrExport: (textureSize: number) => preparePbrTextureExport(asset.current, textureSize),
+  }))
   return (
     <Canvas
       shadows
@@ -428,7 +527,7 @@ export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; styl
       <directionalLight position={[4, 7, 4]} intensity={1.8} color="#ffe6cf" castShadow shadow-mapSize={[1024, 1024]} />
       <directionalLight position={[-4, 2, -3]} intensity={0.7} color="#82c7c2" />
       <Suspense fallback={null}>
-        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
+        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} detailTextureSize={detailTextureSize} proceduralPbr={proceduralPbr} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
       </Suspense>
       <Grid position={[0, -1.12, 0]} args={[20, 20]} cellSize={0.5} cellThickness={0.6} cellColor="#2b3839" sectionSize={2} sectionThickness={0.8} sectionColor="#475757" fadeDistance={12} fadeStrength={1.5} infiniteGrid />
       <Environment preset="studio" environmentIntensity={0.48} />

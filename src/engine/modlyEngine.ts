@@ -1,6 +1,6 @@
 import type { CastSettings, ReferenceImageSet, ReferenceView } from '../types'
 import type { EngineProgress, EngineResult } from './contracts'
-import { QUALITY_LABELS } from '../lib/presets'
+import { miniQualityProfile } from '../lib/presets'
 import { buildStyleConditioning } from './styleRecipes'
 
 const API_BASE = 'http://127.0.0.1:8765'
@@ -73,7 +73,8 @@ export async function generateRealMesh(
   if (suppliedViews.length === 0) throw new Error('Add at least one reference image before generating.')
   const useMultiView = suppliedViews.length > 1
   const useFrontPriority = useMultiView && settings.referenceFusion !== 'full' && Boolean(images.front)
-  const targetTriangles = QUALITY_LABELS[settings.quality].triangles
+  const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
+  const targetTriangles = qualityProfile.triangles
   if (useMultiView && !useFrontPriority) suppliedViews.forEach(([view, file]) => form.append(view, file))
   else form.append('image', images.front ?? suppliedViews[0][1])
   form.append('model_id', useMultiView && !useFrontPriority ? MULTI_MODEL_ID : SINGLE_MODEL_ID)
@@ -81,15 +82,15 @@ export async function generateRealMesh(
   form.append('remesh', 'none')
   form.append('enable_texture', 'false')
   form.append('params', JSON.stringify({
-    num_inference_steps: settings.quality === 'preview' ? 10 : settings.quality === 'balanced' ? 30 : 50,
-    octree_resolution: settings.quality === 'preview' ? 256 : settings.quality === 'balanced' ? 380 : 512,
+    num_inference_steps: qualityProfile.inferenceSteps,
+    octree_resolution: qualityProfile.octreeResolution,
     guidance_scale: 5.5,
     seed: settings.seed,
     // A closed triangle mesh generally has about two faces per vertex.
     // Respect the selected quality instead of silently forcing every
     // Polygon-game cast down to the 5K-triangle preview budget.
     vertex_count: Math.round(targetTriangles / 2),
-    preserve_color: true,
+    preserve_color: settings.materialMode !== 'shape-only',
     // Feed the shape network an edge-preserving, texture-softened copy while
     // retaining the untouched references for the color bake. This prevents
     // hammered metal and leather grain from becoming melted mesh noise.
