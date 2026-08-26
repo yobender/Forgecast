@@ -11,7 +11,7 @@ describe('mockEngine', () => {
       { stepDelayMs: 0 },
     )
     expect([...stages]).toEqual(['concept', 'shape', 'texture', 'finalize'])
-    expect(result.triangles).toBe(20000)
+    expect(result.triangles).toBe(50000)
     vi.unstubAllGlobals()
   })
 })

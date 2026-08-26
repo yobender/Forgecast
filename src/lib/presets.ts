@@ -10,12 +10,17 @@ export const STYLE_LABELS: Record<ArtStyle, string> = {
 }
 
 export const QUALITY_LABELS: Record<MeshQuality, { label: string; triangles: number; texture: string }> = {
-  preview: { label: 'Preview', triangles: 5000, texture: 'Vertex color' },
-  balanced: { label: 'Balanced', triangles: 20000, texture: 'Vertex color' },
-  // High keeps enough of the extracted surface for crisp hard-surface edges.
-  // 50K was too aggressive for detailed props and made the preset look only
-  // marginally better than Balanced after decimation.
-  high: { label: 'High detail', triangles: 150000, texture: 'Vertex color' },
+  // Even a fast cast needs enough surface area for wheels, openings, and other
+  // prop details. The previous 5K target fragmented complex assets badly.
+  preview: { label: 'Fast test', triangles: 20000, texture: '1K' },
+  balanced: { label: 'Balanced', triangles: 50000, texture: '1K' },
+  high: { label: 'Full quality', triangles: 100000, texture: '2K' },
+}
+
+export const HUNYUAN_PBR_HINTS: Record<MeshQuality, string> = {
+  preview: '3 guided views · 1K PBR · fastest way to check shape and color placement.',
+  balanced: '4 guided views · 1K PBR · recommended balance for everyday assets.',
+  high: '6 guided views · 2K PBR · slowest mode; reserve it for a final approved shape.',
 }
 
 export const STAGES: Array<{ key: Exclude<GenerationStage, 'idle'>; label: string }> = [

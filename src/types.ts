@@ -4,7 +4,9 @@ export type MeshQuality = 'preview' | 'balanced' | 'high'
 export type GenerationStage = 'idle' | 'concept' | 'shape' | 'texture' | 'finalize' | 'complete'
 export type ReferenceView = 'front' | 'left' | 'back' | 'right' | 'top' | 'bottom'
 export type ReferenceFusionMode = 'front-priority' | 'full'
+export type MaterialMode = 'shape-only' | 'pbr'
 export type ReferenceImageSet = Partial<Record<ReferenceView, File>>
+export type RealEngineId = 'hunyuan-mini' | 'hunyuan-2.1' | 'trellis-2'
 
 export interface CastSettings {
   prompt: string
@@ -12,7 +14,9 @@ export interface CastSettings {
   style: ArtStyle
   quality: MeshQuality
   seed: number
+  materialMode?: MaterialMode
   referenceFusion?: ReferenceFusionMode
+  engineId?: RealEngineId
 }
 
 export interface CastRecord extends CastSettings {
