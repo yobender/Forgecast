@@ -22,8 +22,8 @@ export const REAL_ENGINE_DEFINITIONS: Record<RealEngineId, RealEngineDefinition>
     id: 'hunyuan-mini',
     name: 'Hunyuan3D 2 Mini',
     shortName: 'Hunyuan Mini',
-    description: 'Fast local shape generation with Forgecast single-view and turntable fusion.',
-    output: 'Color GLB',
+    description: 'Laptop draft engine. One front reference gives the most dependable shape; color is embedded as vertex data.',
+    output: 'Vertex-color GLB',
     supportsMultiView: true,
   },
   'hunyuan-2.1': {
@@ -155,7 +155,7 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
       modelDownloaded: mini.modelDownloaded,
       multiViewDownloaded: mini.multiViewDownloaded,
       label: mini.apiOnline ? mini.label : installed('hunyuan-mini', false) ? inactiveLabel('hunyuan-mini') : 'Not installed',
-      detail: mini.apiOnline ? 'Fast shape engine; supports exact-turntable multi-view fusion.' : REAL_ENGINE_DEFINITIONS['hunyuan-mini'].description,
+      detail: mini.apiOnline ? 'Laptop-safe single-reference shape engine. Exact-turntable fusion remains a desktop-only experiment.' : REAL_ENGINE_DEFINITIONS['hunyuan-mini'].description,
       hardware,
     },
     'hunyuan-2.1': {

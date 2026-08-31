@@ -11,6 +11,31 @@ export type ReferenceImageSet = Partial<Record<ReferenceView, File>>
 export type RealEngineId = 'hunyuan-mini' | 'hunyuan-2.1' | 'trellis-2'
 export type PerformanceMode = 'laptop' | 'desktop'
 export type PrintRefineProfile = 'balanced' | 'fine'
+export type GenerationWorkflow = 'quick' | 'workshop'
+export type WorkflowRole = 'candidate' | 'master'
+export type GameProtection = 'strict' | 'balanced' | 'flexible'
+export interface GameMeshStats {
+  inputTriangles: number
+  outputTriangles: number
+  inputVertices: number
+  outputVertices: number
+  inputBytes: number
+  outputBytes: number
+  targetTriangles: number
+  targetMet: boolean
+  maxAppearanceError: number
+  reductionPercent: number
+  correctedColors: boolean
+  colorSpace: 'linear'
+  sourceFeatures?: {
+    normals: boolean
+    vertexColors: boolean
+    texcoords: boolean
+    baseColorTexture: boolean
+    normalTexture: boolean
+  }
+  warnings: string[]
+}
 
 export interface CastSettings {
   prompt: string
@@ -25,6 +50,7 @@ export interface CastSettings {
   printHeightMm?: number
   printRefineProfile?: PrintRefineProfile
   targetTriangles?: number
+  preserveMasterMesh?: boolean
 }
 
 export interface CastRecord extends CastSettings {
@@ -37,6 +63,13 @@ export interface CastRecord extends CastSettings {
   displayName?: string
   favorite?: boolean
   modelBytes?: number
+  workflowId?: string
+  workflowRole?: WorkflowRole
+  candidateIndex?: number
+  sourceRecordId?: string
+  meshRole?: 'source' | 'game' | 'color-copy'
+  colorSpace?: 'linear'
+  gameStats?: GameMeshStats
 }
 
 export interface MeshInspection {

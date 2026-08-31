@@ -3,6 +3,8 @@ import { Canvas } from '@react-three/fiber'
 import { forwardRef, Suspense, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef } from 'react'
 import * as THREE from 'three'
 import type { ArtStyle, AssetType } from '../types'
+import { captureModelThumbnail } from '../lib/modelThumbnail'
+import { linearizeLegacyVertexColors } from '../lib/vertexColors'
 
 export interface AssetViewerHandle {
   getObject: () => THREE.Object3D | null
@@ -258,14 +260,16 @@ function hasNativePbrMaterial(mesh: THREE.Mesh) {
 
 function applyLightweightVertexMaterial(mesh: THREE.Mesh) {
   const geometry = mesh.geometry.clone()
-  if (!geometry.hasAttribute('normal')) geometry.computeVertexNormals()
   mesh.geometry = geometry
-  mesh.material = new THREE.MeshStandardMaterial({
-    name: 'Forgecast print preview',
+  // Hunyuan Mini projects a lit reference directly into vertex colors. A
+  // Standard material adds a second layer of highlights, making baked white
+  // streaks look glossy and much brighter than the stored color. Show these
+  // assets unlit; native PBR assets continue through their authored material.
+  mesh.material = new THREE.MeshBasicMaterial({
+    name: 'Forgecast neutral vertex-color preview',
     vertexColors: geometry.hasAttribute('color'),
     color: '#ffffff',
-    roughness: 0.82,
-    metalness: 0.08,
+    toneMapped: true,
   })
 }
 
@@ -441,9 +445,9 @@ const GeneratedAsset = forwardRef<THREE.Group, { type: AssetType; style: ArtStyl
   )
 })
 
-const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean; detailTextureSize: number; proceduralPbr: boolean; onReady?: () => void }>(({ url, style, wireframe, detailTextureSize, proceduralPbr, onReady }, ref) => {
+const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wireframe: boolean; detailTextureSize: number; proceduralPbr: boolean; legacyMiniColors: boolean; onReady?: () => void }>(({ url, style, wireframe, detailTextureSize, proceduralPbr, legacyMiniColors, onReady }, ref) => {
   const { scene } = useGLTF(url)
-  const clone = useMemo(() => {
+  const { clone, sourceBounds } = useMemo(() => {
     const result = scene.clone(true)
     result.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return
@@ -451,7 +455,7 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
       // culling prevents pieces from popping in and out while orbiting.
       object.frustumCulled = false
       if (object.geometry.hasAttribute('color') && proceduralPbr && !hasNativePbrMaterial(object)) applyColorAwareMaterials(object, detailTextureSize)
-      else if (object.geometry.hasAttribute('color') && !proceduralPbr) applyLightweightVertexMaterial(object)
+      else if (object.geometry.hasAttribute('color') && !proceduralPbr && !hasNativePbrMaterial(object)) applyLightweightVertexMaterial(object)
       else {
         object.geometry = object.geometry.clone()
         if (!object.geometry.hasAttribute('normal')) object.geometry.computeVertexNormals()
@@ -459,35 +463,36 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
           ? object.material.map((material) => material.clone())
           : object.material.clone()
       }
+      if (legacyMiniColors && scene.userData.forgecastVertexColorSpace !== 'linear') linearizeLegacyVertexColors(object.geometry)
     })
-    return result
+    // Measure before this clone joins the scaled display group. World bounds
+    // measured after switching assets otherwise include the previous scale.
+    return { clone: result, sourceBounds: new THREE.Box3().setFromObject(result) }
   // A stable URL identifies an immutable generated GLB. Some loader result
   // wrappers change identity during app status polling; depending on `scene`
   // caused the clone to be destroyed and fetched again every few seconds.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detailTextureSize, proceduralPbr, url])
+  }, [detailTextureSize, proceduralPbr, legacyMiniColors, url])
   const group = useRef<THREE.Group>(null)
   useImperativeHandle(ref, () => group.current as THREE.Group)
 
   useLayoutEffect(() => {
     if (!group.current) return
-    const bounds = new THREE.Box3().setFromObject(clone)
-    const size = bounds.getSize(new THREE.Vector3())
-    const center = bounds.getCenter(new THREE.Vector3())
+    const size = sourceBounds.getSize(new THREE.Vector3())
+    const center = sourceBounds.getCenter(new THREE.Vector3())
     const scale = 2.8 / Math.max(size.x, size.y, size.z, 0.001)
-    clone.position.set(-center.x, -bounds.min.y, -center.z)
     group.current.scale.setScalar(scale)
-    group.current.position.set(0, -1.1, 0)
+    group.current.position.set(-center.x * scale, -sourceBounds.min.y * scale - 1.1, -center.z * scale)
     const frame = window.requestAnimationFrame(() => onReady?.())
     return () => window.cancelAnimationFrame(frame)
-  }, [clone, onReady])
+  }, [sourceBounds, onReady])
 
   useEffect(() => {
     clone.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return
       const materials = Array.isArray(object.material) ? object.material : [object.material]
       materials.forEach((material) => {
-        if (material instanceof THREE.MeshStandardMaterial) {
+        if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshBasicMaterial) {
           material.wireframe = false
           material.vertexColors = object.geometry.hasAttribute('color')
           material.transparent = wireframe
@@ -497,8 +502,7 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
           // one as a hard face makes curved handles look crumpled. Keep the
           // Only the explicit Low-poly preset is faceted. All print-oriented
           // presets use exported vertex normals for readable curved surfaces.
-          material.flatShading = style === 'low-poly'
-          material.color.set('#ffffff')
+          if (material instanceof THREE.MeshStandardMaterial) material.flatShading = style === 'low-poly'
           material.needsUpdate = true
         }
       })
@@ -515,28 +519,21 @@ const LoadedAsset = forwardRef<THREE.Group, { url: string; style: ArtStyle; wire
   return <group ref={group}><primitive object={clone} /></group>
 })
 
-export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string; detailTextureSize?: number; proceduralPbr?: boolean; onModelReady?: () => void }>(({ type, style, wireframe = false, autoRotate = false, modelUrl, detailTextureSize = 1024, proceduralPbr = true, onModelReady }, ref) => {
+export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; style: ArtStyle; wireframe?: boolean; autoRotate?: boolean; modelUrl?: string; detailTextureSize?: number; proceduralPbr?: boolean; legacyMiniColors?: boolean; onModelReady?: () => void }>(({ type, style, wireframe = false, autoRotate = false, modelUrl, detailTextureSize = 1024, proceduralPbr = true, legacyMiniColors = false, onModelReady }, ref) => {
   const asset = useRef<THREE.Group>(null)
   const renderer = useRef<THREE.WebGLRenderer>(null)
+  const viewerScene = useRef<THREE.Scene>(null)
   useImperativeHandle(ref, () => ({
     getObject: () => asset.current,
     preparePbrExport: (textureSize: number) => preparePbrTextureExport(asset.current, textureSize),
     captureThumbnail: () => {
-      const source = renderer.current?.domElement
-      if (!source || source.width === 0 || source.height === 0) return null
-      const thumbnail = document.createElement('canvas')
-      thumbnail.width = 240
-      thumbnail.height = 180
-      const context = thumbnail.getContext('2d')
-      if (!context) return null
-      context.fillStyle = '#111517'
-      context.fillRect(0, 0, thumbnail.width, thumbnail.height)
-      const sourceAspect = source.width / source.height
-      const targetAspect = thumbnail.width / thumbnail.height
-      const width = sourceAspect > targetAspect ? thumbnail.width : thumbnail.height * sourceAspect
-      const height = sourceAspect > targetAspect ? thumbnail.width / sourceAspect : thumbnail.height
-      context.drawImage(source, (thumbnail.width - width) / 2, (thumbnail.height - height) / 2, width, height)
-      return thumbnail.toDataURL('image/jpeg', 0.72)
+      if (!renderer.current || !asset.current) return null
+      try {
+        return captureModelThumbnail(renderer.current, asset.current, viewerScene.current?.environment ?? null)
+      } catch (error) {
+        console.warn('Model thumbnail could not be captured', error)
+        return null
+      }
     },
   }))
   return (
@@ -544,7 +541,7 @@ export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; styl
       shadows
       camera={{ position: [4.5, 3.2, 5.8], fov: 38 }}
       gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, preserveDrawingBuffer: true }}
-      onCreated={({ gl }) => { renderer.current = gl; gl.toneMappingExposure = 0.82 }}
+      onCreated={({ gl, scene }) => { renderer.current = gl; viewerScene.current = scene; gl.toneMappingExposure = 0.82 }}
     >
       <color attach="background" args={['#111517']} />
       <fog attach="fog" args={['#111517', 8, 15]} />
@@ -553,7 +550,7 @@ export const AssetViewer = forwardRef<AssetViewerHandle, { type: AssetType; styl
       <directionalLight position={[4, 7, 4]} intensity={1.8} color="#ffe6cf" castShadow shadow-mapSize={[1024, 1024]} />
       <directionalLight position={[-4, 2, -3]} intensity={0.7} color="#82c7c2" />
       <Suspense fallback={null}>
-        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} detailTextureSize={detailTextureSize} proceduralPbr={proceduralPbr} onReady={onModelReady} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
+        {modelUrl ? <LoadedAsset ref={asset} url={modelUrl} style={style} wireframe={wireframe} detailTextureSize={detailTextureSize} proceduralPbr={proceduralPbr} legacyMiniColors={legacyMiniColors} onReady={onModelReady} /> : <GeneratedAsset ref={asset} type={type} style={style} wireframe={wireframe} />}
       </Suspense>
       <Grid position={[0, -1.12, 0]} args={[20, 20]} cellSize={0.5} cellThickness={0.6} cellColor="#2b3839" sectionSize={2} sectionThickness={0.8} sectionColor="#475757" fadeDistance={12} fadeStrength={1.5} infiniteGrid />
       <Environment preset="studio" environmentIntensity={0.48} />

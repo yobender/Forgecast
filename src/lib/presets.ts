@@ -26,10 +26,10 @@ export const normalizeGeometryPreset = (value: unknown): ArtStyle => {
 export const QUALITY_LABELS: Record<MeshQuality, { label: string; triangles: number; texture: string }> = {
   // Even a fast cast needs enough surface area for wheels, openings, and other
   // prop details. The previous 5K target fragmented complex assets badly.
-  preview: { label: 'Fast test', triangles: 20000, texture: '1K' },
-  balanced: { label: 'Balanced', triangles: 50000, texture: '1K' },
-  high: { label: 'Full quality', triangles: 100000, texture: '2K' },
-  ultra: { label: 'Ultra fine · slow', triangles: 150000, texture: '2K' },
+  preview: { label: 'Draft', triangles: 20000, texture: '1K' },
+  balanced: { label: 'Standard', triangles: 50000, texture: '1K' },
+  high: { label: 'Detailed', triangles: 100000, texture: '2K' },
+  ultra: { label: 'Final · slow', triangles: 150000, texture: '2K' },
 }
 
 export interface MiniQualityProfile {
@@ -41,9 +41,12 @@ export interface MiniQualityProfile {
 const MINI_QUALITY_PROFILES: Record<'laptop' | 'desktop', Record<MeshQuality, MiniQualityProfile>> = {
   laptop: {
     preview: { triangles: 20000, inferenceSteps: 10, octreeResolution: 256 },
-    balanced: { triangles: 40000, inferenceSteps: 24, octreeResolution: 320 },
-    high: { triangles: 75000, inferenceSteps: 35, octreeResolution: 384 },
-    ultra: { triangles: 100000, inferenceSteps: 60, octreeResolution: 448 },
+    balanced: { triangles: 35000, inferenceSteps: 20, octreeResolution: 320 },
+    high: { triangles: 60000, inferenceSteps: 30, octreeResolution: 384 },
+    // An 8 GB laptop GPU is far more dependable at a 384 grid. More steps can
+    // refine the reconstruction without the 448-grid VRAM spike that caused
+    // long stalls and worker crashes on the laptop.
+    ultra: { triangles: 75000, inferenceSteps: 40, octreeResolution: 384 },
   },
   desktop: {
     preview: { triangles: 20000, inferenceSteps: 10, octreeResolution: 256 },

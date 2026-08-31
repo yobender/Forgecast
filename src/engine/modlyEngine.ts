@@ -7,6 +7,12 @@ const API_BASE = 'http://127.0.0.1:8765'
 const SINGLE_MODEL_ID = 'hunyuan3d-mini/generate'
 const MULTI_MODEL_ID = 'hunyuan3d-mini/multiview'
 
+export const shouldUseMiniMultiView = (
+  suppliedViewCount: number,
+  fusion: CastSettings['referenceFusion'],
+  performanceMode: CastSettings['performanceMode'],
+) => suppliedViewCount > 1 && fusion === 'full' && performanceMode === 'desktop'
+
 export const miniVertexBudget = (
   materialMode: CastSettings['materialMode'],
   targetTriangles: number,
@@ -57,7 +63,7 @@ export async function detectRealEngine(): Promise<RealEngineStatus> {
       modelDownloaded: Boolean(model?.downloaded),
       multiViewAvailable: Boolean(multiViewModel && !multiViewModel.loadError),
       multiViewDownloaded: Boolean(multiViewModel?.downloaded),
-      label: multiViewModel?.downloaded ? 'Hunyuan3D multi-view ready' : model?.downloaded ? 'Hunyuan3D Mini ready' : model ? 'Hunyuan3D needs model files' : 'Hunyuan3D extension unavailable',
+      label: model?.downloaded ? 'Hunyuan3D Mini ready' : model ? 'Hunyuan3D needs model files' : 'Hunyuan3D extension unavailable',
     }
   } catch {
     return { apiOnline: false, modelAvailable: false, modelDownloaded: false, multiViewAvailable: false, multiViewDownloaded: false, label: 'Real AI engine offline' }
@@ -79,8 +85,11 @@ export async function generateRealMesh(
   const form = new FormData()
   const suppliedViews = (Object.entries(images) as Array<[ReferenceView, File]>).filter((entry) => Boolean(entry[1]))
   if (suppliedViews.length === 0) throw new Error('Add at least one reference image before generating.')
-  const useMultiView = suppliedViews.length > 1
-  const useFrontPriority = useMultiView && settings.referenceFusion !== 'full' && Boolean(images.front)
+  // Multi-view is an opt-in desktop experiment. Generated or loosely matched
+  // side views routinely soften and distort the Mini result, while its 4.9 GB
+  // checkpoint also competes with the shape model for laptop storage/VRAM.
+  const useMultiView = shouldUseMiniMultiView(suppliedViews.length, settings.referenceFusion, settings.performanceMode)
+  const useFrontPriority = suppliedViews.length > 1 && !useMultiView && Boolean(images.front)
   const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
   const geometryPreset = GEOMETRY_PRESETS[settings.style]
   const targetTriangles = settings.materialMode === 'pbr' && settings.targetTriangles
@@ -103,7 +112,9 @@ export async function generateRealMesh(
     // forcing every cast down to a preview-sized triangle budget.
     // STL refinement needs the raw reconstruction. Decimating here cannot be
     // undone later and was erasing engraved lines, fingers, straps and edges.
-    vertex_count: miniVertexBudget(settings.materialMode, targetTriangles, settings.style),
+    // Workshop candidates keep the full reconstruction as their protected
+    // master. Game-budget reduction happens only after a candidate is chosen.
+    vertex_count: settings.preserveMasterMesh ? 0 : miniVertexBudget(settings.materialMode, targetTriangles, settings.style),
     preserve_color: !printOutput,
     // Feed the shape network an edge-preserving, texture-softened copy while
     // retaining the untouched references for the color bake. This prevents
@@ -130,11 +141,11 @@ export async function generateRealMesh(
     if (job.status === 'done' && job.output_url) {
       return {
         engine: useFrontPriority
-          ? `Hunyuan3D 2 Front Only · ${suppliedViews.length - 1} refs ignored`
+          ? `Hunyuan3D 2 Mini · front reference only`
           : useMultiView
             ? `Hunyuan3D 2 Multi-View · ${suppliedViews.length} refs`
             : 'Hunyuan3D 2 Mini',
-        triangles: targetTriangles,
+        triangles: settings.preserveMasterMesh ? qualityProfile.triangles : targetTriangles,
         conditioning: buildStyleConditioning(settings.prompt, settings.assetType, settings.style),
         modelUrl: `${API_BASE}${job.output_url}`,
       }

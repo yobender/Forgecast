@@ -4,6 +4,8 @@ import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSyn
 import { createServer } from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { Worker } from 'node:worker_threads'
+import { validateGameOptions } from './lib/game-mesh.mjs'
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runtimeRoot = join(projectRoot, '.runtime')
@@ -13,7 +15,9 @@ const libraryModelsRoot = join(runtimeRoot, 'library', 'models')
 const statePath = join(runtimeRoot, 'active-engine.json')
 const geometryPresets = new Set(['miniature-sculpt', 'hard-surface', 'organic', 'low-poly', 'print-safe'])
 const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-const port = 8764
+const port = Number(process.env.FORGECAST_MANAGER_PORT) || 8764
+const meshJobs = new Map()
+let activeMeshWorker
 
 mkdirSync(logsRoot, { recursive: true })
 mkdirSync(printExportsRoot, { recursive: true })
@@ -287,6 +291,34 @@ const server = createServer(async (request, response) => {
   if (request.method === 'OPTIONS') return sendJson(response, 204, {})
   if (request.method === 'GET' && request.url === '/health') return sendJson(response, 200, { status: 'healthy' })
   if (request.method === 'GET' && request.url === '/engines') return sendJson(response, 200, engineState())
+  if (request.method === 'POST' && request.url === '/game-jobs') {
+    if (activeMeshWorker) return sendJson(response, 409, { error: 'Another mesh operation is running. Wait for it to finish.' })
+    try {
+      const body = JSON.parse(await readBody(request))
+      const options = { operation: body.operation, targetTriangles: body.targetTriangles, protection: body.protection, legacyMiniColor: body.legacyMiniColor }
+      validateGameOptions(options)
+      if (typeof body.filename !== 'string' || !/^[a-f0-9-]+\.glb$/i.test(body.filename)) throw new Error('Choose a retained library model')
+      const inputPath = join(libraryModelsRoot, body.filename)
+      if (!existsSync(inputPath) || statSync(inputPath).size > 300 * 1024 * 1024) throw new Error('Source missing or exceeds the 300 MB mesh limit')
+      // Recheck after reading the asynchronous body so two requests cannot start together.
+      if (activeMeshWorker) return sendJson(response, 409, { error: 'Another mesh operation is running' })
+      const id = randomUUID(), filename = `${randomUUID()}.glb`
+      const job = { id, status: 'running', message: 'Preparing game mesh', url: `/library/models/${filename}` }
+      meshJobs.set(id, job)
+      while (meshJobs.size > 24) meshJobs.delete(meshJobs.keys().next().value)
+      const meshWorker = new Worker(join(projectRoot, 'scripts', 'game-mesh-worker.mjs'), { workerData: { inputPath, outputPath: join(libraryModelsRoot, filename), options } })
+      activeMeshWorker = meshWorker
+      const timeout = setTimeout(() => { Object.assign(job, { status: 'error', error: 'Mesh operation exceeded ten minutes; original source is unchanged.' }); void meshWorker.terminate() }, 10 * 60 * 1000)
+      meshWorker.on('message', (message) => { Object.assign(job, message); if (message.status !== 'running') clearTimeout(timeout) })
+      meshWorker.once('error', (error) => { Object.assign(job, { status: 'error', error: error.message }) })
+      meshWorker.once('exit', () => { clearTimeout(timeout); if (job.status === 'running') Object.assign(job, { status: 'error', error: 'Mesh worker exited before completion' }); if (activeMeshWorker === meshWorker) activeMeshWorker = undefined })
+      return sendJson(response, 202, { id })
+    } catch (error) { return sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) }) }
+  }
+  if (request.method === 'GET' && request.url?.startsWith('/game-jobs/')) {
+    const job = meshJobs.get(request.url.slice('/game-jobs/'.length))
+    return sendJson(response, job ? 200 : 404, job || { error: 'Mesh job not found' })
+  }
   if (request.method === 'GET' && request.url?.startsWith('/exports/')) {
     const outputName = request.url.slice('/exports/'.length)
     if (!/^[a-f0-9-]+\.stl$/i.test(outputName)) return sendJson(response, 400, { error: 'Invalid export name' })
@@ -389,11 +421,12 @@ try {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`[Forgecast] Engine manager listening on http://127.0.0.1:${port}`)
-  if (preferred) activation = activation.catch(() => undefined).then(() => startWorker(preferred)).catch((error) => console.error(error))
+  if (preferred && process.env.FORGECAST_NO_ENGINE_AUTOSTART !== '1') activation = activation.catch(() => undefined).then(() => startWorker(preferred)).catch((error) => console.error(error))
 })
 
 const shutdown = () => {
   server.close()
+  void activeMeshWorker?.terminate()
   void stopWorker().finally(() => process.exit(0))
 }
 process.once('SIGINT', shutdown)
