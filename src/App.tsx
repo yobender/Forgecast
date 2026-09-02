@@ -131,6 +131,7 @@ export default function App() {
   const [engineStatuses, setEngineStatuses] = useState<UnifiedEngineStatuses>(initialEngineStatuses)
   const [releasingGpu, setReleasingGpu] = useState(false)
   const [installingMultiView, setInstallingMultiView] = useState(false)
+  const [multiViewPromptOpen, setMultiViewPromptOpen] = useState(false)
   const [refiningStl, setRefiningStl] = useState(false)
   const [libraryQuery, setLibraryQuery] = useState('')
   const [favoritesOnly, setFavoritesOnly] = useState(false)
@@ -146,6 +147,7 @@ export default function App() {
   const pendingThumbnailId = useRef<string | undefined>(undefined)
   const workshopThumbnailResolver = useRef<((thumbnail?: string) => void) | undefined>(undefined)
   const legacyRecoveryStarted = useRef(false)
+  const multiViewPromptShown = useRef(false)
   const running = stage !== 'idle' && stage !== 'complete'
   const referenceCount = Object.keys(referenceFiles).length
   const shapeReferenceCount = REFERENCE_VIEWS.filter((view) => SHAPE_VIEWS.has(view) && referenceFiles[view]).length
@@ -162,7 +164,7 @@ export default function App() {
   const gameTriangleBudgets = GAME_TRIANGLE_BUDGETS
   const desktopEngineBlocked = laptopMode && selectedEngine !== 'hunyuan-mini'
   const allowFullFusion = selectedEngine === 'hunyuan-mini' && engineDefinition.supportsMultiView
-  const effectiveReferenceFusion: ReferenceFusionMode = allowFullFusion ? referenceFusion : 'front-priority'
+  const effectiveReferenceFusion: ReferenceFusionMode = allowFullFusion && shapeReferenceCount > 1 ? referenceFusion : 'front-priority'
   const engineStarting = realEngine.installed && !realEngine.ready
   const multiViewRequired = allowFullFusion && realEngine.ready && shapeReferenceCount > 1 && referenceFusion === 'full' && !realEngine.multiViewDownloaded
   const loadedViewsLabel = REFERENCE_VIEWS.filter((view) => referenceFiles[view]).join(' · ')
@@ -362,6 +364,13 @@ export default function App() {
   }, [realEngine.multiViewDownloaded])
 
   useEffect(() => {
+    if (multiViewPromptShown.current || selectedEngine !== 'hunyuan-mini' || !realEngine.installed || realEngine.multiViewDownloaded) return
+    if (realEngine.multiViewInstallStatus === undefined || realEngine.multiViewInstallStatus === 'running') return
+    multiViewPromptShown.current = true
+    setMultiViewPromptOpen(true)
+  }, [realEngine.installed, realEngine.multiViewDownloaded, realEngine.multiViewInstallStatus, selectedEngine])
+
+  useEffect(() => {
     if (realEngine.multiViewInstallStatus !== 'error') return
     setInstallingMultiView(false)
     setGenerationError(realEngine.multiViewInstallMessage || 'The multi-view model download failed. Check the Forgecast install log and try again.')
@@ -383,6 +392,7 @@ export default function App() {
 
   const installMultiView = async () => {
     if (installingMultiView) return
+    setMultiViewPromptOpen(false)
     setInstallingMultiView(true)
     setGenerationError('')
     try {
@@ -874,6 +884,19 @@ export default function App() {
   return (
     <main className="app-shell">
       {imageDropActive && <div className="image-drop-overlay"><div><ImagePlus size={34} /><strong>Drop reference images</strong><span>Multiple files fill the next empty view slots</span></div></div>}
+      {multiViewPromptOpen && <div className="setup-dialog-backdrop" role="presentation">
+        <section className="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="multi-view-setup-title">
+          <div className="setup-dialog__icon"><Download size={24} /></div>
+          <span className="eyebrow">OPTIONAL MODEL</span>
+          <h2 id="multi-view-setup-title">Install multi-view support?</h2>
+          <p>Forgecast needs one additional <strong>4.9 GB</strong> Hunyuan checkpoint to combine front, back, left, and right reference images into the same model.</p>
+          <ul><li>One-time resumable download</li><li>Stored locally with the other Forgecast models</li><li>Not needed for front-only casts</li></ul>
+          <div className="setup-dialog__actions">
+            <button className="tool-button" type="button" onClick={() => setMultiViewPromptOpen(false)}>Later</button>
+            <button className="cast-button" type="button" onClick={() => void installMultiView()}><Download size={16} /> Install 4.9 GB model</button>
+          </div>
+        </section>
+      </div>}
       <header className="topbar">
         <div className="brand">
           <BrandMark />
@@ -928,7 +951,7 @@ export default function App() {
                 </button>
               })}
             </div>
-            {referenceCount > 1 && allowFullFusion && <div className="fusion-mode" role="group" aria-label="Reference fusion mode">
+            {shapeReferenceCount > 1 && allowFullFusion && <div className="fusion-mode" role="group" aria-label="Reference fusion mode">
               <button className={referenceFusion === 'full' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('full')}><strong>Use all views</strong><span>Geometry + color coverage</span></button>
               <button className={referenceFusion === 'front-priority' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('front-priority')}><strong>Front only</strong><span>Explicit fallback</span></button>
             </div>}
