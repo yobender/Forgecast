@@ -18,6 +18,11 @@ const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'Wi
 const port = Number(process.env.FORGECAST_MANAGER_PORT) || 8764
 const meshJobs = new Map()
 let activeMeshWorker
+const multiViewModelPath = join(runtimeRoot, 'forgecast-engine', 'models', 'hunyuan3d-mini', 'multiview', 'hunyuan3d-dit-v2-mv-fast', 'model.fp16.safetensors')
+const multiViewExpectedBytes = 4930777530
+let multiViewInstaller
+let multiViewInstallStatus = 'idle'
+let multiViewInstallMessage = ''
 
 mkdirSync(logsRoot, { recursive: true })
 mkdirSync(printExportsRoot, { recursive: true })
@@ -125,12 +130,49 @@ const engineState = () => ({
   activeEngine,
   workerRunning: Boolean(worker && worker.exitCode === null),
   hardware,
+  multiViewInstall: {
+    status: existsSync(multiViewModelPath) && statSync(multiViewModelPath).size === multiViewExpectedBytes ? 'installed' : multiViewInstallStatus,
+    message: multiViewInstallMessage,
+  },
   engines: Object.fromEntries(Object.entries(engines).map(([id, engine]) => [id, {
     name: engine.name,
     installed: engine.installed(),
     active: id === activeEngine,
   }])),
 })
+
+const startMultiViewInstall = () => {
+  if (existsSync(multiViewModelPath) && statSync(multiViewModelPath).size === multiViewExpectedBytes) {
+    multiViewInstallStatus = 'installed'
+    multiViewInstallMessage = 'Multi-view model is already installed.'
+    return
+  }
+  if (multiViewInstaller && multiViewInstaller.exitCode === null) return
+  const script = join(projectRoot, 'scripts', 'install-multiview-model.ps1')
+  if (!existsSync(script)) throw new Error('Multi-view installer is missing from this Forgecast checkout')
+  const log = createWriteStream(join(logsRoot, 'multiview-install.log'), { flags: 'a' })
+  log.write(`\n[${new Date().toISOString()}] Starting multi-view checkpoint download\n`)
+  multiViewInstallStatus = 'running'
+  multiViewInstallMessage = 'Downloading the 4.9 GB multi-view checkpoint. Existing model files are kept and partial downloads resume.'
+  multiViewInstaller = spawn(powershell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], {
+    cwd: projectRoot,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  multiViewInstaller.stdout.pipe(log, { end: false })
+  multiViewInstaller.stderr.pipe(log, { end: false })
+  multiViewInstaller.once('error', (error) => {
+    multiViewInstallStatus = 'error'
+    multiViewInstallMessage = error.message
+  })
+  multiViewInstaller.once('exit', (code) => {
+    const installed = existsSync(multiViewModelPath) && statSync(multiViewModelPath).size === multiViewExpectedBytes
+    multiViewInstallStatus = installed ? 'installed' : 'error'
+    multiViewInstallMessage = installed ? 'Multi-view model installed.' : `Multi-view installer exited with code ${code}. See the install log for details.`
+    log.write(`[${new Date().toISOString()}] ${multiViewInstallMessage}\n`)
+    log.end()
+  })
+}
 
 const readBody = (request) => new Promise((resolveBody, rejectBody) => {
   const chunks = []
@@ -291,6 +333,17 @@ const server = createServer(async (request, response) => {
   if (request.method === 'OPTIONS') return sendJson(response, 204, {})
   if (request.method === 'GET' && request.url === '/health') return sendJson(response, 200, { status: 'healthy' })
   if (request.method === 'GET' && request.url === '/engines') return sendJson(response, 200, engineState())
+  if (request.method === 'POST' && request.url === '/install-multiview') {
+    try {
+      startMultiViewInstall()
+      return sendJson(response, multiViewInstallStatus === 'installed' ? 200 : 202, {
+        status: multiViewInstallStatus,
+        message: multiViewInstallMessage,
+      })
+    } catch (error) {
+      return sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
   if (request.method === 'POST' && request.url === '/game-jobs') {
     if (activeMeshWorker) return sendJson(response, 409, { error: 'Another mesh operation is running. Wait for it to finish.' })
     try {

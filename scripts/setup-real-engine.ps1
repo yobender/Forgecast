@@ -51,6 +51,7 @@ Get-PinnedRepository 'https://github.com/lightningpixel/modly-hunyuan3d-mini-ext
 Apply-ForgecastPatch $modlyRoot (Join-Path $patchesRoot 'modly-forgecast.patch') 'Forgecast Modly integration'
 Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-base.patch') 'Hunyuan extension compatibility'
 Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-runtime.patch') 'Forgecast high-detail generator'
+Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-multiview-v2.patch') 'Forgecast blended multi-view color bake'
 
 New-Item -ItemType Directory -Force $extensionRoot | Out-Null
 Copy-Item -Path (Join-Path $sourceExtension '*') -Destination $extensionRoot -Recurse -Force

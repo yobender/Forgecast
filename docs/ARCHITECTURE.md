@@ -4,7 +4,7 @@ Forgecast is a local React/TypeScript studio that treats image-to-3D models as r
 
 ## Request flow
 
-1. `src/App.tsx` collects the prompt, authoritative front reference, optional saved design references, style, quality, seed, and selected engine.
+1. `src/App.tsx` collects the prompt, synchronized reference set, style, quality, seed, and selected engine. Hunyuan Mini defaults to full fusion when multiple shape views are loaded; front-only behavior must be selected explicitly.
 2. `src/engine/realEngines.ts` probes all engine health endpoints and asks the engine manager to activate the selected worker.
 3. `scripts/engine-manager.mjs` stops the old worker, launches exactly one engine script, and writes logs under `.runtime/logs`.
 4. The selected adapter submits a multipart generation job and polls its status.

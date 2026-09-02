@@ -18,7 +18,7 @@ Forgecast is a local-first image-to-3D studio with selectable Hunyuan3D and TREL
 
 | Engine | Best use | Platform | GPU memory | Output |
 | --- | --- | --- | --- | --- |
-| Hunyuan3D 2 Mini | Laptop drafts from one front reference | Windows | 8 GB minimum; 12 GB+ recommended | Vertex-color GLB |
+| Hunyuan3D 2 Mini | Front-only or synchronized multi-view generation | Windows | 8 GB minimum; more VRAM recommended for multi-view | Vertex-color GLB |
 | Hunyuan3D 2.1 | Single-image shape generation and guided PBR painting | Windows | About 10 GB shape / 21 GB paint | Shape or PBR GLB |
 | TRELLIS.2 4B | Highest-fidelity single-image assets with PBR materials | Linux through WSL2 | 24 GB minimum | PBR GLB |
 
@@ -143,7 +143,11 @@ Backend source, environments, model weights, generated assets, and logs stay und
 
 The backend listens only on `127.0.0.1:8765`. Forgecast detects it automatically; when it is unavailable, the app remains in clearly labeled demo mode.
 
-Laptop-safe mode always submits only the front reference because loosely matched generated views routinely soften or distort Mini reconstructions. Other loaded views remain attached to the recipe as design references. Exact-turntable shape generation remains available as an advanced desktop experiment after manually running `scripts/install-multiview-model.ps1`; normal engine startup does not download its 4.9 GB checkpoint.
+When two or more shape views are loaded, Forgecast now defaults to **Use all views** for Hunyuan Mini. It sends every loaded file as one synchronized request: front, left, back, and right constrain the multi-view shape model, while top and bottom improve color coverage. Forgecast never silently stores the extra files while generating from the front alone; **Front only** is an explicit fallback.
+
+The optional 4.9 GB multi-view checkpoint is installed from the interface and supports resumable downloads. Multi-view is available in both performance profiles when deliberately selected, although the extra checkpoint uses more GPU memory. The references must depict the exact same object, proportions, pose, camera scale, and lighting. Independently generated views can contradict one another and produce worse geometry than a clean front-only cast.
+
+Hunyuan Mini still produces embedded vertex color rather than a true UV-textured PBR material. The multi-view color pass now blends adjacent cameras instead of placing hard seams between front/side/top projections, improving all-around coverage on synchronized references. For an authored UV atlas, normal map, and metallic/roughness textures, use Hunyuan3D 2.1 PBR or TRELLIS.2; those engines currently use the front image for generation.
 
 ## Geometry presets
 

@@ -22,7 +22,7 @@ export const REAL_ENGINE_DEFINITIONS: Record<RealEngineId, RealEngineDefinition>
     id: 'hunyuan-mini',
     name: 'Hunyuan3D 2 Mini',
     shortName: 'Hunyuan Mini',
-    description: 'Laptop draft engine. One front reference gives the most dependable shape; color is embedded as vertex data.',
+    description: 'Local shape engine with optional synchronized multi-view fusion; color is embedded as vertex data.',
     output: 'Vertex-color GLB',
     supportsMultiView: true,
   },
@@ -59,6 +59,8 @@ export interface UnifiedEngineStatus extends RealEngineDefinition {
   label: string
   detail: string
   multiViewDownloaded?: boolean
+  multiViewInstallStatus?: 'idle' | 'running' | 'installed' | 'error'
+  multiViewInstallMessage?: string
   paintAvailable?: boolean
   hardware?: HardwareProfile
 }
@@ -69,6 +71,10 @@ interface ManagerState {
   activeEngine?: RealEngineId
   engines?: Partial<Record<RealEngineId, { installed?: boolean }>>
   hardware?: HardwareProfile
+  multiViewInstall?: {
+    status?: 'idle' | 'running' | 'installed' | 'error'
+    message?: string
+  }
 }
 
 interface StandardJob {
@@ -153,9 +159,11 @@ export async function detectRealEngines(): Promise<UnifiedEngineStatuses> {
       ready: mini.modelAvailable,
       active: active === 'hunyuan-mini' || (!active && mini.apiOnline),
       modelDownloaded: mini.modelDownloaded,
-      multiViewDownloaded: mini.multiViewDownloaded,
+      multiViewDownloaded: mini.multiViewDownloaded || manager.multiViewInstall?.status === 'installed',
+      multiViewInstallStatus: manager.multiViewInstall?.status,
+      multiViewInstallMessage: manager.multiViewInstall?.message,
       label: mini.apiOnline ? mini.label : installed('hunyuan-mini', false) ? inactiveLabel('hunyuan-mini') : 'Not installed',
-      detail: mini.apiOnline ? 'Laptop-safe single-reference shape engine. Exact-turntable fusion remains a desktop-only experiment.' : REAL_ENGINE_DEFINITIONS['hunyuan-mini'].description,
+      detail: mini.apiOnline ? 'Front-only or synchronized multi-view shape generation. Full fusion requires the optional 4.9 GB checkpoint and more GPU memory.' : REAL_ENGINE_DEFINITIONS['hunyuan-mini'].description,
       hardware,
     },
     'hunyuan-2.1': {
@@ -210,6 +218,23 @@ export async function releaseRealEngineGpu(engineId: RealEngineId): Promise<bool
     return response.ok
   } catch {
     return false
+  }
+}
+
+export async function installMiniMultiView(): Promise<{ started: boolean; message: string }> {
+  try {
+    const response = await fetch(`${MANAGER_BASE}/install-multiview`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10000),
+    })
+    const result = await response.json() as { status?: string; message?: string; error?: string }
+    if (!response.ok) throw new Error(result.error || 'Could not start the multi-view installation')
+    return {
+      started: result.status === 'running',
+      message: result.message || (result.status === 'installed' ? 'Multi-view model is already installed.' : 'Multi-view model download started.'),
+    }
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : 'Could not start the multi-view installation')
   }
 }
 

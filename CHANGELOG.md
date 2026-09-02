@@ -4,6 +4,12 @@
 
 ### Changed
 
+- Default Hunyuan Mini multi-reference jobs to full fusion instead of silently submitting only the front image.
+- Allow deliberate multi-view fusion in either performance profile and show the exact views sent to the engine.
+- Add one-click, resumable installation of the optional 4.9 GB multi-view checkpoint.
+- Blend adjacent multi-view color projections to reduce hard seams and improve side, rear, top, and bottom coverage.
+- Label Hunyuan Mini output accurately as vertex color rather than implying that it contains a UV-textured PBR atlas.
+
 - Default to one Final-quality cast; three-seed comparison is now optional.
 - Game output retains the reconstruction before CPU simplification and keeps a separate, linked game GLB.
 - Game copies report measured triangle counts, bytes and target shortfalls; source records remain retained while derivatives reference them.

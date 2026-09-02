@@ -10,8 +10,8 @@ const MULTI_MODEL_ID = 'hunyuan3d-mini/multiview'
 export const shouldUseMiniMultiView = (
   suppliedViewCount: number,
   fusion: CastSettings['referenceFusion'],
-  performanceMode: CastSettings['performanceMode'],
-) => suppliedViewCount > 1 && fusion === 'full' && performanceMode === 'desktop'
+  _performanceMode: CastSettings['performanceMode'],
+) => suppliedViewCount > 1 && fusion === 'full'
 
 export const miniVertexBudget = (
   materialMode: CastSettings['materialMode'],
@@ -85,10 +85,11 @@ export async function generateRealMesh(
   const form = new FormData()
   const suppliedViews = (Object.entries(images) as Array<[ReferenceView, File]>).filter((entry) => Boolean(entry[1]))
   if (suppliedViews.length === 0) throw new Error('Add at least one reference image before generating.')
-  // Multi-view is an opt-in desktop experiment. Generated or loosely matched
-  // side views routinely soften and distort the Mini result, while its 4.9 GB
-  // checkpoint also competes with the shape model for laptop storage/VRAM.
-  const useMultiView = shouldUseMiniMultiView(suppliedViews.length, settings.referenceFusion, settings.performanceMode)
+  const shapeViewCount = suppliedViews.filter(([view]) => ['front', 'left', 'back', 'right'].includes(view)).length
+  // Full fusion is explicit and never silently falls back to the front image.
+  // Top and bottom references join the color pass while the four cardinal
+  // views constrain the multi-view shape checkpoint.
+  const useMultiView = shouldUseMiniMultiView(shapeViewCount, settings.referenceFusion, settings.performanceMode)
   const useFrontPriority = suppliedViews.length > 1 && !useMultiView && Boolean(images.front)
   const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
   const geometryPreset = GEOMETRY_PRESETS[settings.style]

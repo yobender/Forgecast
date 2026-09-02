@@ -9,6 +9,23 @@ if (!(Test-Path $apiPython)) {
   throw 'Real engine is not installed. Run scripts\setup-real-engine.ps1 first.'
 }
 
+# Keep an existing runtime checkout current after a normal Forgecast update.
+# This lightweight patch does not reinstall Python or redownload checkpoints.
+$sourceExtension = Join-Path $runtimeRoot 'modly-hunyuan3d-mini-extension'
+$installedExtension = Join-Path $dataRoot 'extensions\hunyuan3d-mini'
+$multiViewPatch = Join-Path $projectRoot 'scripts\patches\hunyuan-extension-multiview-v2.patch'
+if ((Test-Path (Join-Path $sourceExtension '.git')) -and (Test-Path $multiViewPatch)) {
+  & git -C $sourceExtension apply --recount --check $multiViewPatch 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    & git -C $sourceExtension apply --recount $multiViewPatch
+    if ($LASTEXITCODE -ne 0) { throw 'Could not update the multi-view color bake.' }
+  } else {
+    & git -C $sourceExtension apply --recount --reverse --check $multiViewPatch 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'The installed Hunyuan Mini source does not match the Forgecast multi-view update.' }
+  }
+  Copy-Item -Path (Join-Path $sourceExtension '*') -Destination $installedExtension -Recurse -Force
+}
+
 $env:EXTENSIONS_DIR = Join-Path $dataRoot 'extensions'
 $env:MODELS_DIR = Join-Path $dataRoot 'models'
 $env:WORKSPACE_DIR = Join-Path $dataRoot 'workspace'

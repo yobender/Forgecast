@@ -8,7 +8,7 @@ import { StageRail } from './components/StageRail'
 import { WorkshopTray, type WorkshopCandidate } from './components/WorkshopTray'
 import { mockEngine } from './engine/mockEngine'
 import { createMeshCopy } from './engine/gameMesh'
-import { activateRealEngine, detectRealEngines, generateWithRealEngine, releaseRealEngineGpu, REAL_ENGINE_DEFINITIONS, type UnifiedEngineStatuses } from './engine/realEngines'
+import { activateRealEngine, detectRealEngines, generateWithRealEngine, installMiniMultiView, releaseRealEngineGpu, REAL_ENGINE_DEFINITIONS, type UnifiedEngineStatuses } from './engine/realEngines'
 import { buildStyleConditioning, GEOMETRY_PRESETS } from './engine/styleRecipes'
 import { loadHistory, saveHistory } from './lib/history'
 import { slugify } from './lib/naming'
@@ -120,7 +120,7 @@ export default function App() {
   const [history, setHistory] = useState<CastRecord[]>(loadHistory)
   const [exportOpen, setExportOpen] = useState(false)
   const [referenceFiles, setReferenceFiles] = useState<ReferenceImageSet>({})
-  const [referenceFusion, setReferenceFusion] = useState<ReferenceFusionMode>('front-priority')
+  const [referenceFusion, setReferenceFusion] = useState<ReferenceFusionMode>('full')
   const [referencePreviewUrls, setReferencePreviewUrls] = useState<Partial<Record<ReferenceView, string>>>({})
   const [imageDropActive, setImageDropActive] = useState(false)
   const [wireframe, setWireframe] = useState(false)
@@ -130,6 +130,7 @@ export default function App() {
   const [generationError, setGenerationError] = useState('')
   const [engineStatuses, setEngineStatuses] = useState<UnifiedEngineStatuses>(initialEngineStatuses)
   const [releasingGpu, setReleasingGpu] = useState(false)
+  const [installingMultiView, setInstallingMultiView] = useState(false)
   const [refiningStl, setRefiningStl] = useState(false)
   const [libraryQuery, setLibraryQuery] = useState('')
   const [favoritesOnly, setFavoritesOnly] = useState(false)
@@ -160,10 +161,11 @@ export default function App() {
   const liveTextureSize = laptopMode ? 1024 : 2048
   const gameTriangleBudgets = GAME_TRIANGLE_BUDGETS
   const desktopEngineBlocked = laptopMode && selectedEngine !== 'hunyuan-mini'
-  const allowFullFusion = !laptopMode && selectedEngine === 'hunyuan-mini' && engineDefinition.supportsMultiView
+  const allowFullFusion = selectedEngine === 'hunyuan-mini' && engineDefinition.supportsMultiView
   const effectiveReferenceFusion: ReferenceFusionMode = allowFullFusion ? referenceFusion : 'front-priority'
   const engineStarting = realEngine.installed && !realEngine.ready
-  const multiViewInstalling = allowFullFusion && realEngine.ready && referenceCount > 1 && referenceFusion === 'full' && !realEngine.multiViewDownloaded
+  const multiViewRequired = allowFullFusion && realEngine.ready && shapeReferenceCount > 1 && referenceFusion === 'full' && !realEngine.multiViewDownloaded
+  const loadedViewsLabel = REFERENCE_VIEWS.filter((view) => referenceFiles[view]).join(' · ')
   const hunyuanPaintBlocked = selectedEngine === 'hunyuan-2.1' && materialMode === 'pbr' && realEngine.ready && realEngine.paintAvailable === false
   const hasPbrOutput = Boolean(modelUrl) && materialMode === 'pbr' && selectedEngine !== 'hunyuan-mini'
   const hasVertexColorOutput = Boolean(modelUrl) && materialMode === 'pbr' && selectedEngine === 'hunyuan-mini'
@@ -341,11 +343,6 @@ export default function App() {
   }, [performanceSetting])
 
   useEffect(() => {
-    if (!laptopMode) return
-    if (referenceFusion !== 'front-priority') setReferenceFusion('front-priority')
-  }, [laptopMode, referenceFusion])
-
-  useEffect(() => {
     if (!desktopEngineBlocked) void activateRealEngine(selectedEngine)
   }, [desktopEngineBlocked, selectedEngine])
 
@@ -361,6 +358,16 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (realEngine.multiViewDownloaded) setInstallingMultiView(false)
+  }, [realEngine.multiViewDownloaded])
+
+  useEffect(() => {
+    if (realEngine.multiViewInstallStatus !== 'error') return
+    setInstallingMultiView(false)
+    setGenerationError(realEngine.multiViewInstallMessage || 'The multi-view model download failed. Check the Forgecast install log and try again.')
+  }, [realEngine.multiViewInstallMessage, realEngine.multiViewInstallStatus])
+
+  useEffect(() => {
     if (!laptopMode || selectedEngine !== 'hunyuan-mini' || running || stage !== 'complete') return
     const timer = window.setTimeout(() => { void releaseRealEngineGpu('hunyuan-mini') }, 3 * 60 * 1000)
     return () => window.clearTimeout(timer)
@@ -372,6 +379,20 @@ export default function App() {
     const released = await releaseRealEngineGpu(selectedEngine)
     setEngineMessage(released ? 'GPU memory released. The model will reload on the next cast.' : 'Could not release the GPU worker.')
     setReleasingGpu(false)
+  }
+
+  const installMultiView = async () => {
+    if (installingMultiView) return
+    setInstallingMultiView(true)
+    setGenerationError('')
+    try {
+      const result = await installMiniMultiView()
+      setEngineMessage(result.message)
+      if (!result.started) setInstallingMultiView(false)
+    } catch (error) {
+      setInstallingMultiView(false)
+      setGenerationError(error instanceof Error ? error.message : 'Could not start the multi-view installation')
+    }
   }
 
   const statusText = useMemo(() => {
@@ -589,8 +610,8 @@ export default function App() {
       setGenerationError(`${engineDefinition.name} accepts one front reference. Choose Front only or switch to Hunyuan3D 2 Mini for turntable fusion.`)
       return
     }
-    if (selectedEngine === 'hunyuan-mini' && referenceCount > 1 && effectiveReferenceFusion === 'full' && !realEngine.multiViewDownloaded) {
-      setGenerationError('The Hunyuan Mini multi-view model is still installing. Forgecast will enable fusion automatically when it is ready.')
+    if (selectedEngine === 'hunyuan-mini' && shapeReferenceCount > 1 && effectiveReferenceFusion === 'full' && !realEngine.multiViewDownloaded) {
+      setGenerationError('Install the 4.9 GB Hunyuan Mini multi-view model first. Forgecast will not silently ignore the side and rear references.')
       return
     }
     if (hunyuanPaintBlocked) {
@@ -903,15 +924,16 @@ export default function App() {
                 const preview = referencePreviewUrls[view]
                 return <button className={`reference-slot ${file ? 'reference-slot--ready' : ''}`} key={view} onClick={() => openReferencePicker(view)} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy' }} onDrop={(event) => { event.preventDefault(); event.stopPropagation(); imageDragDepth.current = 0; setImageDropActive(false); const dropped = Array.from(event.dataTransfer.files).find(isSupportedImage); selectReferenceFile(view, dropped ?? null) }}>
                   {preview ? <img src={preview} alt={`${view} reference`} /> : <ImagePlus size={16} />}
-                  <span><strong>{view}</strong><small>{file ? file.name : view === 'front' ? 'Shape authority' : laptopMode ? 'Saved guide only' : SHAPE_VIEWS.has(view) ? 'Shape + color' : 'Color guide'}</small></span>
+                  <span><strong>{view}</strong><small>{file ? file.name : view === 'front' ? 'Required anchor' : SHAPE_VIEWS.has(view) ? 'Shape + color' : 'Color coverage'}</small></span>
                 </button>
               })}
             </div>
             {referenceCount > 1 && allowFullFusion && <div className="fusion-mode" role="group" aria-label="Reference fusion mode">
-              <button className={referenceFusion === 'front-priority' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('front-priority')}><strong>Front only</strong><span>Best quality · ignores others</span></button>
-              <button className={referenceFusion === 'full' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('full')}><strong>Full fusion</strong><span>Exact turntables only</span></button>
+              <button className={referenceFusion === 'full' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('full')}><strong>Use all views</strong><span>Geometry + color coverage</span></button>
+              <button className={referenceFusion === 'front-priority' ? 'active' : ''} type="button" onClick={() => setReferenceFusion('front-priority')}><strong>Front only</strong><span>Explicit fallback</span></button>
             </div>}
-            <div className="reference-set__note"><strong>{effectiveReferenceFusion === 'front-priority' ? 'Single-reference cast:' : 'Full shape fusion:'}</strong> {effectiveReferenceFusion === 'front-priority' ? 'front controls the generated geometry and color' : 'front · left · back · right geometry'} <span>{effectiveReferenceFusion === 'front-priority' ? 'Other loaded views stay with the recipe but are not sent to the laptop shape model.' : 'Use only synchronized turntable renders of the exact same object and pose.'}</span></div>
+            <div className="reference-set__note"><strong>{effectiveReferenceFusion === 'front-priority' ? 'Front-only cast:' : 'All-view cast:'}</strong> {effectiveReferenceFusion === 'front-priority' ? 'only the front image will be sent' : `${loadedViewsLabel || 'loaded views'} will be sent together`} <span>{effectiveReferenceFusion === 'front-priority' ? 'Choose Use all views above to include the side, rear, top, and bottom references.' : 'Front, left, back, and right constrain shape; top and bottom improve color coverage. Use synchronized views of the exact same object.'}</span></div>
+            {multiViewRequired && <button className="tool-button multi-view-install" type="button" disabled={installingMultiView} onClick={() => void installMultiView()}><Download size={14} /> {installingMultiView ? 'Downloading 4.9 GB multi-view model…' : 'Install 4.9 GB multi-view model'}</button>}
           </div>
 
           {generationWorkflow === 'workshop' && <section className={`workshop-reference ${referenceApproved ? 'workshop-reference--approved' : ''}`}>
@@ -1008,11 +1030,11 @@ export default function App() {
 
           {desktopEngineBlocked && <div className="baked-style-note"><Cpu size={12} /> Desktop-only engine blocked by Laptop safe mode. Use Hunyuan Mini here, or explicitly choose Desktop full to override.</div>}
 
-          <div className={`engine-note ${realEngine.ready ? 'engine-note--ready' : ''}`}><Cpu size={16} /><span><strong>{realEngine.ready ? (referenceCount > 1 ? (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? 'Single-reference generation ready' : multiViewInstalling ? 'Multi-view model is installing' : `${shapeReferenceCount}-view full fusion ready`) : referenceFiles.front ? `${engineDefinition.shortName} ready` : 'Add a front reference') : engineStarting ? `${engineDefinition.shortName} is starting` : 'Demo mode only — prompts are not generated'}</strong><small>{realEngine.ready ? (referenceCount > 1 && (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView) ? 'Uses the front image only; additional views remain saved as design references.' : realEngine.detail) : engineStarting ? 'The engine manager is switching workers. This usually takes a few seconds; model weights load on the first cast.' : `${realEngine.label}. ${realEngine.detail}`}</small></span></div>
+          <div className={`engine-note ${realEngine.ready ? 'engine-note--ready' : ''}`}><Cpu size={16} /><span><strong>{realEngine.ready ? (referenceCount > 1 ? (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? 'Front-only generation selected' : multiViewRequired ? 'Multi-view model required' : `${shapeReferenceCount}-view full fusion ready`) : referenceFiles.front ? `${engineDefinition.shortName} ready` : 'Add a front reference') : engineStarting ? `${engineDefinition.shortName} is starting` : 'Demo mode only — prompts are not generated'}</strong><small>{realEngine.ready ? (referenceCount > 1 && (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView) ? 'Only the front image will be sent. Forgecast will never claim that the saved side views were fused.' : effectiveReferenceFusion === 'full' && referenceCount > 1 ? `Sending ${loadedViewsLabel} as one synchronized reference set.` : realEngine.detail) : engineStarting ? 'The engine manager is switching workers. This usually takes a few seconds; model weights load on the first cast.' : `${realEngine.label}. ${realEngine.detail}`}</small></span></div>
           {generationError && <div className="generation-error">{generationError}</div>}
 
-          <button className="cast-button" onClick={() => { if (generationWorkflow === 'workshop') void startWorkshop(); else void startCast() }} disabled={running || Boolean(meshProcessing) || refiningStl || multiViewInstalling || engineStarting || hunyuanPaintBlocked || desktopEngineBlocked || (generationWorkflow === 'workshop' && Boolean(referenceFiles.front) && !referenceApproved) || (generationWorkflow === 'workshop' && workshopPhase === 'select')}>
-            {running ? <><RefreshCw className="spin" size={18} /> {generationWorkflow === 'workshop' ? `WORKSHOP · ${progress}%` : realEngine.ready ? `GENERATING · ${progress}%` : `SIMULATING · ${progress}%`}</> : generationWorkflow === 'workshop' ? <><Sparkles size={19} /> {desktopEngineBlocked ? 'CHOOSE LAPTOP ENGINE' : workshopPhase === 'select' ? 'CHOOSE A MASTER IN THE VIEWER' : !referenceFiles.front ? 'ADD FRONT REFERENCE' : !referenceApproved ? 'APPROVE REFERENCE ABOVE' : workshopPhase === 'complete' ? 'CAST 3 NEW CANDIDATES' : 'CAST 3 FINAL CANDIDATES'}</> : <><WandSparkles size={19} /> {desktopEngineBlocked ? 'DESKTOP ENGINE · CHANGE PROFILE' : engineStarting ? 'STARTING ENGINE' : realEngine.ready ? (multiViewInstalling ? 'INSTALL MULTI-VIEW MANUALLY' : referenceCount > 1 ? (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? `CAST FRONT WITH ${engineDefinition.shortName.toUpperCase()}` : `FUSE ${referenceCount} REFERENCES`) : referenceFiles.front ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : 'ADD FRONT REFERENCE') : (stage === 'complete' ? 'RE-RUN DEMO' : 'RUN DEMO PREVIEW')}</>}
+          <button className="cast-button" onClick={() => { if (multiViewRequired) void installMultiView(); else if (generationWorkflow === 'workshop') void startWorkshop(); else void startCast() }} disabled={running || Boolean(meshProcessing) || refiningStl || installingMultiView || engineStarting || hunyuanPaintBlocked || desktopEngineBlocked || (generationWorkflow === 'workshop' && Boolean(referenceFiles.front) && !referenceApproved) || (generationWorkflow === 'workshop' && workshopPhase === 'select')}>
+            {running ? <><RefreshCw className="spin" size={18} /> {generationWorkflow === 'workshop' ? `WORKSHOP · ${progress}%` : realEngine.ready ? `GENERATING · ${progress}%` : `SIMULATING · ${progress}%`}</> : generationWorkflow === 'workshop' ? <><Sparkles size={19} /> {desktopEngineBlocked ? 'CHOOSE LAPTOP ENGINE' : workshopPhase === 'select' ? 'CHOOSE A MASTER IN THE VIEWER' : !referenceFiles.front ? 'ADD FRONT REFERENCE' : !referenceApproved ? 'APPROVE REFERENCE ABOVE' : workshopPhase === 'complete' ? 'CAST 3 NEW CANDIDATES' : 'CAST 3 FINAL CANDIDATES'}</> : <><WandSparkles size={19} /> {desktopEngineBlocked ? 'DESKTOP ENGINE · CHANGE PROFILE' : engineStarting ? 'STARTING ENGINE' : installingMultiView ? 'DOWNLOADING MULTI-VIEW MODEL' : multiViewRequired ? 'INSTALL MULTI-VIEW MODEL' : realEngine.ready ? (referenceCount > 1 ? (effectiveReferenceFusion === 'front-priority' || !engineDefinition.supportsMultiView ? `CAST FRONT WITH ${engineDefinition.shortName.toUpperCase()}` : `FUSE ALL ${referenceCount} REFERENCES`) : referenceFiles.front ? `CAST WITH ${engineDefinition.shortName.toUpperCase()}` : 'ADD FRONT REFERENCE') : (stage === 'complete' ? 'RE-RUN DEMO' : 'RUN DEMO PREVIEW')}</>}
           </button>
         </aside>
 
