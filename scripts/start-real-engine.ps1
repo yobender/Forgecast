@@ -5,19 +5,39 @@ $runtimeRoot = Join-Path $projectRoot '.runtime'
 $modlyApi = Join-Path $runtimeRoot 'modly\api'
 $dataRoot = Join-Path $runtimeRoot 'forgecast-engine'
 $apiPython = Join-Path $modlyApi '.venv\Scripts\python.exe'
-$multiViewInstaller = Join-Path $PSScriptRoot 'install-multiview-model.ps1'
-$multiViewModel = Join-Path $dataRoot 'models\hunyuan3d-mini\multiview\hunyuan3d-dit-v2-mv-fast\model.fp16.safetensors'
-$multiViewExpectedBytes = 4930777530
-
 if (!(Test-Path $apiPython)) {
   throw 'Real engine is not installed. Run scripts\setup-real-engine.ps1 first.'
 }
 
-$multiViewReady = (Test-Path -LiteralPath $multiViewModel) -and (Get-Item -LiteralPath $multiViewModel).Length -eq $multiViewExpectedBytes
-if (!$multiViewReady -and (Test-Path -LiteralPath $multiViewInstaller)) {
-  $downloadLog = Join-Path $dataRoot 'multiview-download.log'
-  $downloadErrorLog = Join-Path $dataRoot 'multiview-download-error.log'
-  Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$multiViewInstaller`"" -WindowStyle Hidden -RedirectStandardOutput $downloadLog -RedirectStandardError $downloadErrorLog
+# Keep an existing runtime checkout current after a normal Forgecast update.
+# This lightweight patch does not reinstall Python or redownload checkpoints.
+$sourceExtension = Join-Path $runtimeRoot 'modly-hunyuan3d-mini-extension'
+$installedExtension = Join-Path $dataRoot 'extensions\hunyuan3d-mini'
+$multiViewPatches = @(
+  (Join-Path $projectRoot 'scripts\patches\hunyuan-extension-multiview-node.patch'),
+  (Join-Path $projectRoot 'scripts\patches\hunyuan-extension-multiview-v2.patch')
+)
+if (Test-Path (Join-Path $sourceExtension '.git')) {
+  foreach ($multiViewPatch in $multiViewPatches) {
+    if (!(Test-Path $multiViewPatch)) { throw "Missing Forgecast runtime patch: $multiViewPatch" }
+    $previousErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & git -C $sourceExtension apply --recount --check $multiViewPatch 2>$null
+    $canApply = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = $previousErrorPreference
+    if ($canApply) {
+      & git -C $sourceExtension apply --recount $multiViewPatch
+      if ($LASTEXITCODE -ne 0) { throw "Could not apply Forgecast runtime patch: $multiViewPatch" }
+    } else {
+      $previousErrorPreference = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      & git -C $sourceExtension apply --recount --reverse --check $multiViewPatch 2>$null
+      $alreadyApplied = $LASTEXITCODE -eq 0
+      $ErrorActionPreference = $previousErrorPreference
+      if (!$alreadyApplied) { throw 'The installed Hunyuan Mini source does not match the Forgecast multi-view update.' }
+    }
+  }
+  Copy-Item -Path (Join-Path $sourceExtension '*') -Destination $installedExtension -Recurse -Force
 }
 
 $env:EXTENSIONS_DIR = Join-Path $dataRoot 'extensions'

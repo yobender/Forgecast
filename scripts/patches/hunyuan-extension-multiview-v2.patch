@@ -1,0 +1,60 @@
+diff --git a/generator.py b/generator.py
+--- a/generator.py
++++ b/generator.py
+@@ -260,30 +260,43 @@ class Hunyuan3DMiniGenerator(BaseGenerator):
+             }
+             available = [view for view in view_directions if view in views]
+             direction_matrix = np.stack([view_directions[view] for view in available])
+-            selected = np.argmax(normals @ direction_matrix.T, axis=1)
++            # Blend adjacent cameras instead of assigning every vertex to one
++            # hard box-projection face. This uses every supplied view, removes
++            # the visible front/side seams, and keeps top/bottom coverage when
++            # those references are present.
++            alignment = np.clip(normals @ direction_matrix.T, 0.0, 1.0)
++            weights = np.power(alignment, 6.0)
+ 
+             mins = vertices.min(axis=0)
+             spans = np.maximum(np.ptp(vertices, axis=0), 1e-8)
+             normalized = np.clip((vertices - mins) / spans, 0.0, 1.0)
+-            result = np.zeros((len(vertices), 4), dtype=np.uint8)
+-            result[:, 3] = 255
++            accumulated = np.zeros((len(vertices), 3), dtype=np.float32)
++            weight_total = np.zeros(len(vertices), dtype=np.float32)
+ 
+             for view_index, view in enumerate(available):
+-                vertex_indexes = np.flatnonzero(selected == view_index)
++                vertex_indexes = np.flatnonzero(weights[:, view_index] > 1e-6)
+                 if len(vertex_indexes) == 0:
+                     continue
+                 xyz = normalized[vertex_indexes]
+                 if view == "front":
+                     u, v = xyz[:, 0], xyz[:, 1]
+                 elif view == "back":
+                     u, v = 1.0 - xyz[:, 0], xyz[:, 1]
+                 elif view == "left":
+                     u, v = xyz[:, 2], xyz[:, 1]
+                 elif view == "right":
+                     u, v = 1.0 - xyz[:, 2], xyz[:, 1]
+                 elif view == "top":
+                     u, v = xyz[:, 0], 1.0 - xyz[:, 2]
+                 else:  # bottom
+                     u, v = xyz[:, 0], xyz[:, 2]
+-                result[vertex_indexes] = self._sample_reference(views[view], u, v)
++                sampled = self._sample_reference(views[view], u, v)[:, :3].astype(np.float32)
++                view_weights = weights[vertex_indexes, view_index]
++                accumulated[vertex_indexes] += sampled * view_weights[:, None]
++                weight_total[vertex_indexes] += view_weights
++
++            uncovered = weight_total <= 1e-6
++            if uncovered.any():
++                fallback_view = "front" if "front" in views else available[0]
++                xyz = normalized[uncovered]
++                sampled = self._sample_reference(views[fallback_view], xyz[:, 0], xyz[:, 1])[:, :3]
++                accumulated[uncovered] = sampled
++                weight_total[uncovered] = 1.0
+ 
++            result = np.full((len(vertices), 4), 255, dtype=np.uint8)
++            result[:, :3] = np.clip(accumulated / weight_total[:, None], 0, 255).astype(np.uint8)
+             mesh.visual.vertex_colors = result
+             return mesh
+         except Exception as exc:

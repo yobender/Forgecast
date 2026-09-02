@@ -1,0 +1,19 @@
+diff --git a/manifest.json b/manifest.json
+--- a/manifest.json
++++ b/manifest.json
+@@ -69,7 +69,16 @@
+           "tooltip": "Seed for reproducibility. Set to -1 for a random seed."
+         }
+       ]
++    },
++    {
++      "id": "multiview",
++      "name": "Multi-view Fusion",
++      "input": "images",
++      "output": "mesh",
++      "hf_repo": "tencent/Hunyuan3D-2mv",
++      "download_check": "hunyuan3d-dit-v2-mv-fast/model.fp16.safetensors",
++      "params_schema": []
+     }
+   ]
+ }

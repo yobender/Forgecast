@@ -1,5 +1,16 @@
 import type { ArtStyle, AssetType } from '../types'
 
+export type ShapeGuideProfile = 'detail' | 'hard-surface' | 'organic' | 'simplified' | 'print-safe'
+
+export interface GeometryPresetProfile {
+  guideProfile: ShapeGuideProfile
+  guidanceScale: number
+  targetTriangleRatio: number
+  preserveRawPrintMesh: boolean
+  flatShading: boolean
+  forceWatertightRemesh: boolean
+}
+
 export interface StyleConditioning {
   positive: string
   negative: string
@@ -9,48 +20,105 @@ export interface StyleConditioning {
     shading: 'flat' | 'smooth'
     preferredTriangles: number
   }
+  generation: GeometryPresetProfile
   palette: string[]
 }
 
 const SUBJECT_HINTS: Record<AssetType, string> = {
-  prop: 'single freestanding game prop, centered, fully visible',
-  character: 'single full-body game character in a neutral A-pose, centered, fully visible',
-  creature: 'single full-body game creature in a neutral standing pose, centered, fully visible',
+  prop: 'single freestanding prop, centered and fully visible',
+  character: 'single full-body character in a neutral stance, centered and fully visible',
+  creature: 'single full-body creature in a neutral standing pose, centered and fully visible',
 }
 
-const POLYGON_GAME: Omit<StyleConditioning, 'positive'> & { prefix: string } = {
-  prefix: 'stylized low-poly 3D game asset, chunky appealing proportions, strong readable silhouette, deliberately simplified forms, broad faceted planes, hand-authored game-art appearance, restrained color blocking, subtle painted gradients, clean isolated presentation',
-  negative: 'photorealistic, scanned surface, noisy micro-detail, thin fragile pieces, excessive bevels, high-frequency texture, realistic skin pores, cluttered background, multiple objects, text, logo, watermark, smooth subdivided sculpture',
-  geometry: {
-    silhouette: 'Readable at thumbnail distance with exaggerated primary and secondary forms.',
-    topology: 'Low-density manifold mesh; preserve planar facets and avoid decorative micro-geometry.',
-    shading: 'flat',
-    preferredTriangles: 5000,
+export const GEOMETRY_PRESETS: Record<ArtStyle, GeometryPresetProfile> = {
+  'miniature-sculpt': {
+    guideProfile: 'detail',
+    guidanceScale: 7.0,
+    targetTriangleRatio: 1,
+    preserveRawPrintMesh: true,
+    flatShading: false,
+    forceWatertightRemesh: false,
   },
-  palette: ['#4f967d', '#e0ad57', '#263c38', '#d9d4bd'],
+  'hard-surface': {
+    guideProfile: 'hard-surface',
+    guidanceScale: 6.5,
+    targetTriangleRatio: 0.9,
+    preserveRawPrintMesh: true,
+    flatShading: false,
+    forceWatertightRemesh: false,
+  },
+  organic: {
+    guideProfile: 'organic',
+    guidanceScale: 5.5,
+    targetTriangleRatio: 0.9,
+    preserveRawPrintMesh: true,
+    flatShading: false,
+    forceWatertightRemesh: false,
+  },
+  'low-poly': {
+    guideProfile: 'simplified',
+    guidanceScale: 4.5,
+    targetTriangleRatio: 0.2,
+    preserveRawPrintMesh: false,
+    flatShading: true,
+    forceWatertightRemesh: false,
+  },
+  'print-safe': {
+    guideProfile: 'print-safe',
+    guidanceScale: 5.8,
+    targetTriangleRatio: 0.8,
+    preserveRawPrintMesh: true,
+    flatShading: false,
+    forceWatertightRemesh: true,
+  },
 }
 
-const GENERIC_NEGATIVE = 'cluttered background, multiple objects, text, logo, watermark, broken geometry, floating pieces'
+const PRESET_COPY: Record<ArtStyle, { positive: string; negative: string; silhouette: string; topology: string }> = {
+  'miniature-sculpt': {
+    positive: 'high-relief miniature sculpt with readable secondary forms and preserved engraved detail',
+    negative: 'melted detail, shallow relief, over-smoothed edges, fragile micro-parts',
+    silhouette: 'Preserve the reference silhouette and readable miniature-scale relief.',
+    topology: 'Retain the raw reconstruction for print output; avoid destructive decimation.',
+  },
+  'hard-surface': {
+    positive: 'edge-defined hard-surface reconstruction with crisp plates, bevels, panels and mechanical breaks',
+    negative: 'rounded plate edges, melted panel lines, inflated mechanical forms',
+    silhouette: 'Favor straight boundaries, plate separation and crisp mechanical corners.',
+    topology: 'Use edge-enhanced shape guides and retain raw print geometry.',
+  },
+  organic: {
+    positive: 'smooth organic reconstruction with coherent skin, cloth and creature transitions',
+    negative: 'noisy skin, staircase contours, harsh faceting, disconnected surface grain',
+    silhouette: 'Preserve broad anatomical and cloth forms with smooth transitions.',
+    topology: 'Suppress surface noise before reconstruction while retaining major folds.',
+  },
+  'low-poly': {
+    positive: 'deliberately simplified low-poly reconstruction with broad planes and an economical silhouette',
+    negative: 'dense micro-geometry, unnecessary subdivisions, noisy triangulation',
+    silhouette: 'Prioritize primary forms that remain readable after strong reduction.',
+    topology: 'Generate from a simplified guide and decimate to a true low-poly budget.',
+  },
+  'print-safe': {
+    positive: 'sturdy printable reconstruction with closed gaps, attached details and strengthened silhouettes',
+    negative: 'floating pieces, pinholes, paper-thin gaps, isolated droplets, fragile protrusions',
+    silhouette: 'Slightly close and strengthen narrow silhouette gaps before reconstruction.',
+    topology: 'Retain raw shape geometry and force a watertight STL remesh at export.',
+  },
+}
 
 export function buildStyleConditioning(prompt: string, assetType: AssetType, style: ArtStyle): StyleConditioning {
-  if (style === 'polygon-game') {
-    return {
-      positive: `${POLYGON_GAME.prefix}, ${SUBJECT_HINTS[assetType]}. Subject: ${prompt.trim()}`,
-      negative: POLYGON_GAME.negative,
-      geometry: POLYGON_GAME.geometry,
-      palette: POLYGON_GAME.palette,
-    }
-  }
-
+  const preset = GEOMETRY_PRESETS[style]
+  const copy = PRESET_COPY[style]
   return {
-    positive: `${style.replace('-', ' ')} 3D asset, ${SUBJECT_HINTS[assetType]}. Subject: ${prompt.trim()}`,
-    negative: GENERIC_NEGATIVE,
+    positive: `${copy.positive}, ${SUBJECT_HINTS[assetType]}. Subject: ${prompt.trim()}`,
+    negative: `${copy.negative}, cluttered background, multiple objects, text, logo, watermark, broken geometry`,
     geometry: {
-      silhouette: 'Clear primary silhouette.',
-      topology: 'Manifold mesh suitable for automatic cleanup.',
-      shading: style === 'low-poly' ? 'flat' : 'smooth',
-      preferredTriangles: style === 'low-poly' ? 5000 : 20000,
+      silhouette: copy.silhouette,
+      topology: copy.topology,
+      shading: preset.flatShading ? 'flat' : 'smooth',
+      preferredTriangles: Math.round(50000 * preset.targetTriangleRatio),
     },
+    generation: preset,
     palette: [],
   }
 }

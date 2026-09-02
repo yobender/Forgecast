@@ -34,13 +34,13 @@ function Get-PinnedRepository([string]$url, [string]$destination, [string]$commi
 }
 
 function Apply-ForgecastPatch([string]$repository, [string]$patchFile, [string]$label) {
-  & git -C $repository apply --check $patchFile 2>$null
+  & git -C $repository apply --recount --check $patchFile 2>$null
   if ($LASTEXITCODE -eq 0) {
-    & git -C $repository apply $patchFile
+    & git -C $repository apply --recount $patchFile
     Assert-LastCommand "$label patch"
     return
   }
-  & git -C $repository apply --reverse --check $patchFile 2>$null
+  & git -C $repository apply --recount --reverse --check $patchFile 2>$null
   if ($LASTEXITCODE -ne 0) {
     throw "$label patch does not match the pinned source. Delete .runtime and run setup again."
   }
@@ -51,6 +51,8 @@ Get-PinnedRepository 'https://github.com/lightningpixel/modly-hunyuan3d-mini-ext
 Apply-ForgecastPatch $modlyRoot (Join-Path $patchesRoot 'modly-forgecast.patch') 'Forgecast Modly integration'
 Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-base.patch') 'Hunyuan extension compatibility'
 Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-runtime.patch') 'Forgecast high-detail generator'
+Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-multiview-node.patch') 'Forgecast multi-view model registration'
+Apply-ForgecastPatch $sourceExtension (Join-Path $patchesRoot 'hunyuan-extension-multiview-v2.patch') 'Forgecast blended multi-view color bake'
 
 New-Item -ItemType Directory -Force $extensionRoot | Out-Null
 Copy-Item -Path (Join-Path $sourceExtension '*') -Destination $extensionRoot -Recurse -Force

@@ -1,11 +1,25 @@
 import type { CastSettings, ReferenceImageSet, ReferenceView } from '../types'
 import type { EngineProgress, EngineResult } from './contracts'
-import { QUALITY_LABELS } from '../lib/presets'
-import { buildStyleConditioning } from './styleRecipes'
+import { miniQualityProfile } from '../lib/presets'
+import { buildStyleConditioning, GEOMETRY_PRESETS } from './styleRecipes'
 
 const API_BASE = 'http://127.0.0.1:8765'
 const SINGLE_MODEL_ID = 'hunyuan3d-mini/generate'
 const MULTI_MODEL_ID = 'hunyuan3d-mini/multiview'
+
+export const shouldUseMiniMultiView = (
+  suppliedViewCount: number,
+  fusion: CastSettings['referenceFusion'],
+  _performanceMode: CastSettings['performanceMode'],
+) => suppliedViewCount > 1 && fusion === 'full'
+
+export const miniVertexBudget = (
+  materialMode: CastSettings['materialMode'],
+  targetTriangles: number,
+  style: CastSettings['style'] = 'miniature-sculpt',
+) => materialMode === 'shape-only' && GEOMETRY_PRESETS[style].preserveRawPrintMesh
+  ? 0
+  : Math.round(targetTriangles / 2)
 
 export interface RealEngineStatus {
   apiOnline: boolean
@@ -49,7 +63,7 @@ export async function detectRealEngine(): Promise<RealEngineStatus> {
       modelDownloaded: Boolean(model?.downloaded),
       multiViewAvailable: Boolean(multiViewModel && !multiViewModel.loadError),
       multiViewDownloaded: Boolean(multiViewModel?.downloaded),
-      label: multiViewModel?.downloaded ? 'Hunyuan3D multi-view ready' : model?.downloaded ? 'Hunyuan3D Mini ready' : model ? 'Hunyuan3D needs model files' : 'Hunyuan3D extension unavailable',
+      label: model?.downloaded ? 'Hunyuan3D Mini ready' : model ? 'Hunyuan3D needs model files' : 'Hunyuan3D extension unavailable',
     }
   } catch {
     return { apiOnline: false, modelAvailable: false, modelDownloaded: false, multiViewAvailable: false, multiViewDownloaded: false, label: 'Real AI engine offline' }
@@ -71,9 +85,18 @@ export async function generateRealMesh(
   const form = new FormData()
   const suppliedViews = (Object.entries(images) as Array<[ReferenceView, File]>).filter((entry) => Boolean(entry[1]))
   if (suppliedViews.length === 0) throw new Error('Add at least one reference image before generating.')
-  const useMultiView = suppliedViews.length > 1
-  const useFrontPriority = useMultiView && settings.referenceFusion !== 'full' && Boolean(images.front)
-  const targetTriangles = QUALITY_LABELS[settings.quality].triangles
+  const shapeViewCount = suppliedViews.filter(([view]) => ['front', 'left', 'back', 'right'].includes(view)).length
+  // Full fusion is explicit and never silently falls back to the front image.
+  // Top and bottom references join the color pass while the four cardinal
+  // views constrain the multi-view shape checkpoint.
+  const useMultiView = shouldUseMiniMultiView(shapeViewCount, settings.referenceFusion, settings.performanceMode)
+  const useFrontPriority = suppliedViews.length > 1 && !useMultiView && Boolean(images.front)
+  const qualityProfile = miniQualityProfile(settings.quality, settings.performanceMode === 'laptop')
+  const geometryPreset = GEOMETRY_PRESETS[settings.style]
+  const targetTriangles = settings.materialMode === 'pbr' && settings.targetTriangles
+    ? settings.targetTriangles
+    : Math.max(4000, Math.round(qualityProfile.triangles * geometryPreset.targetTriangleRatio))
+  const printOutput = settings.materialMode === 'shape-only'
   if (useMultiView && !useFrontPriority) suppliedViews.forEach(([view, file]) => form.append(view, file))
   else form.append('image', images.front ?? suppliedViews[0][1])
   form.append('model_id', useMultiView && !useFrontPriority ? MULTI_MODEL_ID : SINGLE_MODEL_ID)
@@ -81,19 +104,24 @@ export async function generateRealMesh(
   form.append('remesh', 'none')
   form.append('enable_texture', 'false')
   form.append('params', JSON.stringify({
-    num_inference_steps: settings.quality === 'preview' ? 10 : settings.quality === 'balanced' ? 30 : 50,
-    octree_resolution: settings.quality === 'preview' ? 256 : settings.quality === 'balanced' ? 380 : 512,
-    guidance_scale: 5.5,
+    num_inference_steps: qualityProfile.inferenceSteps,
+    octree_resolution: qualityProfile.octreeResolution,
+    guidance_scale: geometryPreset.guidanceScale,
     seed: settings.seed,
     // A closed triangle mesh generally has about two faces per vertex.
-    // Respect the selected quality instead of silently forcing every
-    // Polygon-game cast down to the 5K-triangle preview budget.
-    vertex_count: Math.round(targetTriangles / 2),
-    preserve_color: true,
+    // Respect quality and the selected geometry preset instead of silently
+    // forcing every cast down to a preview-sized triangle budget.
+    // STL refinement needs the raw reconstruction. Decimating here cannot be
+    // undone later and was erasing engraved lines, fingers, straps and edges.
+    // Workshop candidates keep the full reconstruction as their protected
+    // master. Game-budget reduction happens only after a candidate is chosen.
+    vertex_count: settings.preserveMasterMesh ? 0 : miniVertexBudget(settings.materialMode, targetTriangles, settings.style),
+    preserve_color: !printOutput,
     // Feed the shape network an edge-preserving, texture-softened copy while
     // retaining the untouched references for the color bake. This prevents
     // hammered metal and leather grain from becoming melted mesh noise.
-    clean_shape_guides: settings.quality === 'high',
+    clean_shape_guides: true,
+    shape_guide_profile: geometryPreset.guideProfile,
     shape_source: useFrontPriority ? 'front' : 'all',
   }))
 
@@ -114,11 +142,11 @@ export async function generateRealMesh(
     if (job.status === 'done' && job.output_url) {
       return {
         engine: useFrontPriority
-          ? `Hunyuan3D 2 Front Only · ${suppliedViews.length - 1} refs ignored`
+          ? `Hunyuan3D 2 Mini · front reference only`
           : useMultiView
             ? `Hunyuan3D 2 Multi-View · ${suppliedViews.length} refs`
             : 'Hunyuan3D 2 Mini',
-        triangles: targetTriangles,
+        triangles: settings.preserveMasterMesh ? qualityProfile.triangles : targetTriangles,
         conditioning: buildStyleConditioning(settings.prompt, settings.assetType, settings.style),
         modelUrl: `${API_BASE}${job.output_url}`,
       }
